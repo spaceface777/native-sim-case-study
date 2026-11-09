@@ -80,7 +80,9 @@ if [[ $steps == *zephyr* ]]; then
 		tests/kernel/semaphore/semaphore tests/kernel/msgq/msgq_api tests/kernel/fifo/fifo_api
 		tests/kernel/events/event_api tests/kernel/poll tests/kernel/workq/work
 		tests/kernel/mem_slab/mslab_api tests/lib/c_lib/common tests/boards/native_sim/cpu_wait)
+	# Windows: deep build directories would exceed its path length limit.
+	[[ $(uname -s) != MINGW* ]] || short=--short-build-path
 	ZEPHYR_TOOLCHAIN_VARIANT=cosmocc COSMOCC_TOOLCHAIN_PATH=$cosmocc \
 		python "$ZEPHYR_BASE/scripts/twister" -p native_sim/native/64 --outdir "$build/twister" \
-		--inline-logs $(printf -- "-T $ZEPHYR_BASE/%s " "${tests[@]}")
+		--inline-logs ${short:-} $(printf -- "-T $ZEPHYR_BASE/%s " "${tests[@]}")
 fi

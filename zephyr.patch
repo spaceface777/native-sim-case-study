@@ -1,4 +1,4 @@
-From aceaccceeaeafcacebfb4cfaeaacbda5fe288f72 Mon Sep 17 00:00:00 2001
+From cfecebfddcceeeddfedb930f4baca76a98323e3e Mon Sep 17 00:00:00 2001
 From: Raul Hernandez <me@spaceface.dev>
 Date: Mon, 9 Nov 2026 17:47:17 +0100
 Subject: [PATCH] native_sim: add the cosmocc toolchain
@@ -52,15 +52,16 @@ Elsewhere:
  boards/native/native_sim/twister.yaml         |   4 +
  cmake/modules/FindHostTools.cmake             |   5 +-
  cmake/toolchain/cosmocc/Kconfig.defconfig     |  15 ++
- cmake/toolchain/cosmocc/generic.cmake         | 137 ++++++++++++++++++
+ cmake/toolchain/cosmocc/generic.cmake         | 139 ++++++++++++++++++
  cmake/toolchain/cosmocc/include/stdarg.h      |  16 ++
  cmake/toolchain/cosmocc/include/stddef.h      |  34 +++++
  cmake/toolchain/cosmocc/target.cmake          |  16 ++
  scripts/native_simulator/Makefile             |   2 +-
  .../native_simulator/common/src/nsi_errno.c   |   3 +-
+ .../native_simulator/native/src/timer_model.c |   8 +-
  .../pylib/twister/twisterlib/testinstance.py  |   4 +-
  scripts/pylib/twister/twisterlib/testplan.py  |   6 +-
- 15 files changed, 255 insertions(+), 13 deletions(-)
+ 16 files changed, 262 insertions(+), 16 deletions(-)
  create mode 100644 cmake/toolchain/cosmocc/Kconfig.defconfig
  create mode 100644 cmake/toolchain/cosmocc/generic.cmake
  create mode 100644 cmake/toolchain/cosmocc/include/stdarg.h
@@ -211,10 +212,10 @@ index 00000000000..0a5bb5bbb73
 +	default 16384
 diff --git a/cmake/toolchain/cosmocc/generic.cmake b/cmake/toolchain/cosmocc/generic.cmake
 new file mode 100644
-index 00000000000..8fa11222b6e
+index 00000000000..275ab7b77d8
 --- /dev/null
 +++ b/cmake/toolchain/cosmocc/generic.cmake
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,139 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +# cosmocc: GCC and GNU binutils for Cosmopolitan Libc (https://github.com/jart/cosmopolitan).
@@ -229,6 +230,8 @@ index 00000000000..8fa11222b6e
 +
 +zephyr_get(COSMOCC_TOOLCHAIN_PATH)
 +assert(COSMOCC_TOOLCHAIN_PATH "COSMOCC_TOOLCHAIN_PATH is not set")
++# cosmocc's driver scripts need / separators, also on Windows.
++file(TO_CMAKE_PATH "${COSMOCC_TOOLCHAIN_PATH}" COSMOCC_TOOLCHAIN_PATH)
 +zephyr_get(COSMOCC_PORTABLE)
 +
 +# Build for the host CPU by default. Cosmopolitan supports Windows on x86-64 only.
@@ -463,6 +466,26 @@ index 946246ab5b1..1082de9d681 100644
  	{0, 0},
  	ERR(EPERM),
  	ERR(ENOENT),
+diff --git a/scripts/native_simulator/native/src/timer_model.c b/scripts/native_simulator/native/src/timer_model.c
+index d70e512017a..127e59af3c3 100644
+--- a/scripts/native_simulator/native/src/timer_model.c
++++ b/scripts/native_simulator/native/src/timer_model.c
+@@ -134,10 +134,12 @@ static void hwtimer_update_timer(void)
+ static inline void host_clock_gettime(struct timespec *tv)
+ {
+ #if defined(CLOCK_MONOTONIC_RAW)
+-	clock_gettime(CLOCK_MONOTONIC_RAW, tv);
+-#else
+-	clock_gettime(CLOCK_MONOTONIC, tv);
++	/* Some hosts do not support it, e.g. Cosmopolitan Libc on x86-64 macOS */
++	if (clock_gettime(CLOCK_MONOTONIC_RAW, tv) == 0) {
++		return;
++	}
+ #endif
++	clock_gettime(CLOCK_MONOTONIC, tv);
+ }
+ 
+ /*
 diff --git a/scripts/pylib/twister/twisterlib/testinstance.py b/scripts/pylib/twister/twisterlib/testinstance.py
 index cfd9a7166f7..cd7131569d9 100644
 --- a/scripts/pylib/twister/twisterlib/testinstance.py

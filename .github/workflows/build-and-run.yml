@@ -39,6 +39,10 @@ jobs:
           . venv/*/activate
           pip install cmake ninja pyelftools pyyaml pykwalify packaging jsonschema \
             pytest tabulate natsort psutil colorama ply junitparser python-dotenv anytree
+      - name: Let Linux start Cosmopolitan programs
+        if: runner.os == 'Linux'
+        # Some images register a binfmt_misc handler (Mono's) that claims all "MZ" files.
+        run: for f in /proc/sys/fs/binfmt_misc/*; do ! grep -qs '^magic 4d5a' "$f" || echo -1 | sudo tee "$f"; done
       - uses: actions/cache@v4
         with:
           path: build/cosmocc-4.0.2.zip
