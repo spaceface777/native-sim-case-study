@@ -12,8 +12,8 @@ config() { sed -n "s/^$1:=//p" "$zephyr/NSI/nsi_config"; }
 nsi=$(config NSI_PATH)
 read -r -a cc <<<"$(config NSI_CC)"         # cosmocc's driver, maybe after a launcher
 read -r -a link <<<"$(config NSI_LINKER)"   # and how the toolchain links executables
-for word in "${cc[@]}"; do [[ $word != *-unknown-cosmo-cc ]] || driver=$word; done
-tools=${driver%-unknown-cosmo-cc}-linux-cosmo- # cosmocc's GNU binutils
+objcopy=$(config NSI_OBJCOPY)
+tools=${objcopy%objcopy*}                   # cosmocc's GNU binutils
 rm -rf "$out" && mkdir -p "$out/runner"
 
 # 1. The native simulator runner, compiled as its Makefile does. The coroutine backend

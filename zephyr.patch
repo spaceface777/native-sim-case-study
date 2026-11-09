@@ -1,4 +1,4 @@
-From adaaeacdeddeecfdcadf2004b362770de3437b1c Mon Sep 17 00:00:00 2001
+From bcafeecaafaccfbcaaeb6bc171bc29006e6be8fa Mon Sep 17 00:00:00 2001
 From: Raul Hernandez <me@spaceface.dev>
 Date: Mon, 9 Nov 2026 17:47:17 +0100
 Subject: [PATCH] native_sim: add the cosmocc toolchain
@@ -52,7 +52,7 @@ Elsewhere:
  boards/native/native_sim/twister.yaml         |   4 +
  cmake/modules/FindHostTools.cmake             |   5 +-
  cmake/toolchain/cosmocc/Kconfig.defconfig     |  15 ++
- cmake/toolchain/cosmocc/generic.cmake         | 139 ++++++++++++++++++
+ cmake/toolchain/cosmocc/generic.cmake         | 142 ++++++++++++++++++
  cmake/toolchain/cosmocc/include/stdarg.h      |  16 ++
  cmake/toolchain/cosmocc/include/stddef.h      |  34 +++++
  cmake/toolchain/cosmocc/target.cmake          |  16 ++
@@ -61,7 +61,7 @@ Elsewhere:
  .../native_simulator/native/src/timer_model.c |   8 +-
  .../pylib/twister/twisterlib/testinstance.py  |   4 +-
  scripts/pylib/twister/twisterlib/testplan.py  |   6 +-
- 16 files changed, 281 insertions(+), 35 deletions(-)
+ 16 files changed, 284 insertions(+), 35 deletions(-)
  create mode 100644 cmake/toolchain/cosmocc/Kconfig.defconfig
  create mode 100644 cmake/toolchain/cosmocc/generic.cmake
  create mode 100644 cmake/toolchain/cosmocc/include/stdarg.h
@@ -212,10 +212,10 @@ index 00000000000..0a5bb5bbb73
 +	default 16384
 diff --git a/cmake/toolchain/cosmocc/generic.cmake b/cmake/toolchain/cosmocc/generic.cmake
 new file mode 100644
-index 00000000000..275ab7b77d8
+index 00000000000..e8814e16467
 --- /dev/null
 +++ b/cmake/toolchain/cosmocc/generic.cmake
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,142 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +# cosmocc: GCC and GNU binutils for Cosmopolitan Libc (https://github.com/jart/cosmopolitan).
@@ -296,12 +296,15 @@ index 00000000000..275ab7b77d8
 +endif()
 +
 +# Zephyr's code is freestanding. The native simulator runner uses Cosmopolitan Libc, through
-+# cosmocc's own compiler driver, which also links the executable.
++# cosmocc's own compiler driver, which also links the executable. It is started by a script:
++# cosmocc's driver finds itself through its path, which make on Windows gives it with \.
 +set(cosmocc_driver ${cosmocc_bin}/${NATIVE_TARGET_HOST}-unknown-cosmo-cc)
 +if(COSMOCC_LINUX_ONLY)
 +  set(cosmocc_driver_flags -moptlinux)
 +endif()
-+set(NATIVE_RUNNER_C_COMPILER "${cosmocc_driver} ${cosmocc_driver_flags}")
++set(NATIVE_RUNNER_C_COMPILER ${cosmocc_dir}/cc)
++cosmocc_install(${NATIVE_RUNNER_C_COMPILER}
++  "#!/bin/sh\nexec '${cosmocc_driver}' ${cosmocc_driver_flags} \"$@\"\n" EXECUTABLE)
 +set(NATIVE_RUNNER_LINKER ${NATIVE_RUNNER_C_COMPILER})
 +
 +# On Linux, the driver's Linux-only executables are ELF. Elsewhere, finish its executables:
