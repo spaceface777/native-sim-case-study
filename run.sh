@@ -1,139 +1,86 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Build, validate and time the case study with Cosmopolitan Libc, for this host's CPU.
-#
-#   ./run.sh [build] [validate] [bench] [report]      (default: build validate bench)
-#
-# build     Linux (x86-64 or AArch64) only: compile the firmware once, then assemble one
-#           simulator per runner backend. Needs ZEPHYR_BASE (upstream Zephyr v4.5.0).
-# validate  scripts/validate.sh for every backend. Linux or macOS.
-# bench     SAMPLES runs of SIM_US world microseconds per backend, interleaved. Linux or
-#           macOS. BASELINE=<dir> also times <dir>/<backend>/simulator[.com] in the same
-#           interleaved order: the previous run.sh's builds, or another cosmocc's.
-# report    Print the median table of RESULTS=<dir> (default: the latest bench).
-# Environment: BUILD (default ./build), OPT (default -O3), SIM_US (default one minute),
-# SAMPLES (default 5), PIN (bench command prefix, e.g. "taskset -c 0"), COSMOCC (optional
-# prepared toolchain).
+# Build, check and time the 20-device world for this host's OS and CPU:
+#   ./run.sh [build] [check] [bench] [zephyr]     default: build check bench
+# build and zephyr need ZEPHYR_BASE: upstream Zephyr v4.5.0 with zephyr.patch applied.
+# bench runs SAMPLES (5) worlds of SIM_US (60000000) microseconds per backend.
+# zephyr runs Zephyr's own samples and test suites below with twister, built with cosmocc.
+# COSMOCC_PORTABLE=1 builds portable executables. RUNNER_CFLAGS=-DCORO_SAVE_CONTEXT gives
+# each coroutine its own errno, floating-point environment and C++ exception state.
 set -e -o pipefail
 cd "$(dirname "$0")"
-export LC_ALL=C BUILD=${BUILD:-$PWD/build}
-SIM_US=${SIM_US:-60000000}
-SAMPLES=${SAMPLES:-5}
-OPT=${OPT:--O3}
-source scripts/cosmocc.sh
-steps=${*:-build validate bench}
+build=${BUILD:-$PWD/build}
+steps=${*:-build check bench}
+backends='pthreads coroutines'
+cosmocc=$build/cosmocc-4.0.2 # GCC 14 and GNU binutils for Cosmopolitan Libc
 
-# Name, NCT, NCE, coroutine primitive, display label.
-backends=(
-	'pthreads     pthreads   pthreads   -        —'
-	'ucontext-nct coroutines pthreads   ucontext ucontext'
-	'longjmp-nct  coroutines pthreads   longjmp  makecontext + _longjmp'
-	'asm-nct      coroutines pthreads   asm      Assembly'
-	'ucontext     coroutines coroutines ucontext ucontext'
-	'longjmp      coroutines coroutines longjmp  makecontext + _longjmp'
-	'asm          coroutines coroutines asm      Assembly'
-)
-firmware=$BUILD/firmware/case-study
-simulator() { echo "$BUILD/$COSMO_ARCH/$1/simulator.com"; }
+# Download and unpack cosmocc, once.
+cosmocc_setup() {
+	[[ ! -d $cosmocc ]] || return 0
+	mkdir -p "$build"
+	[[ -f $cosmocc.zip ]] || curl -fsSL -o "$cosmocc.zip" \
+		https://github.com/jart/cosmopolitan/releases/download/4.0.2/cosmocc-4.0.2.zip
+	{ sha256sum "$cosmocc.zip" 2>/dev/null || shasum -a 256 "$cosmocc.zip"; } |
+		grep -q ^85b8c37a406d862e656ad4ec14be9f6ce474c1b436b9615e91a55208aced3f44 ||
+		{ echo "$cosmocc.zip: wrong SHA-256" >&2; exit 1; }
+	rm -rf "$cosmocc.part" && unzip -q "$cosmocc.zip" -d "$cosmocc.part" && mv "$cosmocc.part" "$cosmocc"
+}
+
+# Build a Zephyr application for native_sim with Zephyr's cosmocc toolchain, no west modules.
+zephyr_build() {
+	{
+		cmake -S "$1" -B "$2" -GNinja -DBOARD=native_sim/native/64 -DZEPHYR_MODULES= \
+			-DZEPHYR_TOOLCHAIN_VARIANT=cosmocc -DCOSMOCC_TOOLCHAIN_PATH="$cosmocc"
+		cmake --build "$2"
+	} >"$2.log" 2>&1
+}
 
 if [[ $steps == *build* ]]; then
-	[[ $(uname -s) == Linux ]] || { echo "Build on Linux (see tools/container), then run: $0 validate bench" >&2; exit 1; }
-	echo "Building the firmware ($COSMO_ARCH, $OPT)"
-	scripts/build-firmware.sh app "$firmware" "-DCONFIG_COMPILER_OPT=\"$OPT\"" >"$BUILD/firmware.log" 2>&1 ||
-		{ tail -n 30 "$BUILD/firmware.log"; exit 1; }
-	instances=$(sed -n 's/^#define INSTANCES *\([0-9]*\).*/\1/p' app/api.h)
-	firmwares=()
-	for ((i = 0; i < instances; i++)); do firmwares+=("$firmware"); done
-	for row in "${backends[@]}"; do
-		read -r backend nct nce coro label <<<"$row"
-		out=$(dirname "$(simulator "$backend")")
-		mkdir -p "$out"
-		CFLAGS=$OPT scripts/assemble.sh --nct "$nct" --nce "$nce" --coro "${coro/-/asm}" \
-			"$out" simulator.c "${firmwares[@]}" >"$out.log" 2>&1 || { tail -n 30 "$out.log"; exit 1; }
-		tail -n 1 "$out.log"
+	cosmocc_setup
+	# The firmware, compiled once.
+	zephyr_build app "$build/firmware" || { tail -n 30 "$build/firmware.log"; exit 1; }
+	instances=$(sed -n 's/^#define INSTANCES *//p' app/api.h)
+	for backend in $backends; do
+		scripts/assemble.sh "$build/firmware" "$instances" "$build/$backend" $backend
 	done
 fi
 
-if [[ $steps == *validate* ]]; then
-	for row in "${backends[@]}"; do
-		read -r backend nct nce rest <<<"$row"
-		threads=pthreads
-		[[ $nce == pthreads ]] || threads=single
-		scripts/validate.sh "$(simulator "$backend")" "$threads"
+if [[ $steps == *check* ]]; then
+	for backend in $backends; do
+		for reference in reference/*.txt; do
+			"$build/$backend/simulator.exe" "$(basename "$reference" .txt)" | cmp - "$reference"
+		done
+		# Entering every device on every tick, instead of only busy ones, changes nothing.
+		"$build/$backend/simulator.exe" 60000000 always | cmp - reference/60000000.txt
+		echo "$backend: output matches $(echo reference/*.txt)"
 	done
 fi
 
 if [[ $steps == *bench* ]]; then
-	results=$BUILD/results/$(date '+%Y%m%d-%H%M%S')
-	runs=()
-	for row in "${backends[@]}"; do
-		read -r backend rest <<<"$row"
-		runs+=("cosmo/$backend $(simulator "$backend")")
-		for binary in "${BASELINE:-/nonexistent}/$backend"/simulator{,.com}; do
-			[[ ! -x $binary ]] || { runs+=("baseline/$backend $binary"); break; }
-		done
+	samples=${SAMPLES:-5} us=${SIM_US:-60000000} TIMEFORMAT=%3R
+	echo "Median of $samples runs of $us simulated microseconds on $(uname -s) $(uname -m):"
+	echo '| Backend | Wall s | RT | Speedup |'
+	echo '|---|---:|---:|---:|'
+	for backend in $backends; do
+		wall=$(for ((i = 0; i < samples; i++)); do
+			{ time "$build/$backend/simulator.exe" "$us" >/dev/null; } 2>&1
+		done | sort -n | awk '{v[NR] = $1} END {print v[int((NR + 1) / 2)]}')
+		first=${first:-$wall}
+		awk -v b=$backend -v w="$wall" -v us="$us" -v p="$first" \
+			'BEGIN {printf "| %s | %.3f | %.0fx | %.2fx |\n", b, w, us / 1e6 / w, p / w}'
 	done
-	loader=$(cosmo_loader)
-	expected=reference/$SIM_US.txt
-	[[ -f $expected ]] || expected=$results/expected.txt
-	mkdir -p "$results"
-	TIMEFORMAT='%3R'
-	for ((repeat = 0; repeat < SAMPLES; repeat++)); do
-		# Alternate the order between samples, so drift affects every binary alike.
-		for ((i = 0; i < ${#runs[@]}; i++)); do
-			j=$i
-			((repeat % 2 == 0)) || j=$((${#runs[@]} - 1 - i))
-			read -r name binary <<<"${runs[$j]}"
-			mkdir -p "$results/$name"
-			command=("$binary")
-			[[ $binary != *.com || -z $loader ]] || command=("$loader" "$binary")
-			command=(${PIN:-} "${command[@]}")
-			output=$results/$name/run-$repeat.txt
-			{ time "${command[@]}" "$SIM_US" >"$output"; } 2>>"$results/$name/times.txt"
-			# Every run must reproduce the first one, and the stored reference if there is one.
-			[[ -f $expected ]] || cp "$output" "$expected"
-			cmp -s "$output" "$expected" || { echo "$output differs from $expected" >&2; exit 1; }
-		done
-	done
-	cp "$expected" "$results/expected.txt" 2>/dev/null || true
-	echo "$SIM_US $SAMPLES $(uname -s) $(uname -m) ${PIN:-unpinned}" >"$results/meta"
-	RESULTS=$results
 fi
 
-# Report medians from a results directory (default: the latest one).
-if [[ $steps == *bench* || $steps == *report* ]]; then
-	results=${RESULTS:-$(ls -d "$BUILD"/results/*/ | tail -n 1)}
-	results=${results%/}
-	read -r sim_us samples os cpu pin <"$results/meta"
-	median() { sort -n "$1" | awk '{v[NR] = $1} END {print (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2}'; }
-	reference=$(median "$results/cosmo/pthreads/times.txt")
-	baseline=
-	[[ ! -d $results/baseline ]] || baseline=1
-	{
-		echo "$samples runs of $sim_us simulated microseconds; $os $cpu; ${pin:-unpinned}; medians in seconds"
-		echo "Result: $(tail -n 1 "$results/expected.txt"), output checksum $(cksum <"$results/expected.txt" | cut -d' ' -f1)"
-		echo
-		if [[ -n $baseline ]]; then
-			echo '| NCT | NCE | Primitive | Baseline s | Cosmopolitan s | Cosmopolitan RT | Cosmopolitan speedup | Baseline / Cosmopolitan |'
-			echo '|---|---|---|---:|---:|---:|---:|---:|'
-		else
-			echo '| NCT | NCE | Primitive | Wall s | RT | Speedup |'
-			echo '|---|---|---|---:|---:|---:|'
-		fi
-		for row in "${backends[@]}"; do
-			read -r backend nct nce coro label <<<"$row"
-			wall=$(median "$results/cosmo/$backend/times.txt")
-			rt=$(awk -v s="$sim_us" -v w="$wall" 'BEGIN {printf "%.1fx", s / 1000000 / w}')
-			speedup=$(awk -v r="$reference" -v w="$wall" 'BEGIN {printf "%.2fx", r / w}')
-			if [[ -z $baseline ]]; then
-				printf '| %s | %s | %s | %.3f | %s | **%s** |\n' "$nct" "$nce" "$label" "$wall" "$rt" "$speedup"
-			elif [[ -f $results/baseline/$backend/times.txt ]]; then
-				previous=$(median "$results/baseline/$backend/times.txt")
-				ratio=$(awk -v p="$previous" -v w="$wall" 'BEGIN {printf "%.2fx", p / w}')
-				printf '| %s | %s | %s | %.3f | %.3f | %s | %s | **%s** |\n' "$nct" "$nce" "$label" "$previous" "$wall" "$rt" "$speedup" "$ratio"
-			else
-				printf '| %s | %s | %s | — | %.3f | %s | %s | — |\n' "$nct" "$nce" "$label" "$wall" "$rt" "$speedup"
-			fi
-		done
-	} | tee "$results/results.md" "$BUILD/results-$os-$cpu.md"
+if [[ $steps == *zephyr* ]]; then
+	cosmocc_setup
+	# Zephyr's own samples and test suites, run by twister as ordinary native_sim executables.
+	tests=(samples/hello_world samples/synchronization samples/philosophers tests/ztest/base
+		tests/kernel/common tests/kernel/threads/thread_apis tests/kernel/sched/schedule_api
+		tests/kernel/timer/timer_api tests/kernel/sleep tests/kernel/mutex/mutex_api
+		tests/kernel/semaphore/semaphore tests/kernel/msgq/msgq_api tests/kernel/fifo/fifo_api
+		tests/kernel/events/event_api tests/kernel/poll tests/kernel/workq/work
+		tests/kernel/mem_slab/mslab_api tests/lib/c_lib/common tests/boards/native_sim/cpu_wait)
+	ZEPHYR_TOOLCHAIN_VARIANT=cosmocc COSMOCC_TOOLCHAIN_PATH=$cosmocc \
+		python "$ZEPHYR_BASE/scripts/twister" -p native_sim/native/64 --outdir "$build/twister" \
+		--inline-logs $(printf -- "-T $ZEPHYR_BASE/%s " "${tests[@]}")
 fi

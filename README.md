@@ -4,186 +4,118 @@ A case study for [Zephyr #120914](https://github.com/zephyrproject-rtos/zephyr/i
 
 Each device has its own Zephyr kernel, application state, clock, hardware models, and runner. The host and all 20 children link into one statically linked executable. No child images load at runtime.
 
-The executable is built with [Cosmopolitan Libc](https://github.com/jart/cosmopolitan)'s `cosmocc` (GCC 14 and GNU binutils) from **unmodified upstream Zephyr v4.5.0**. Each build targets the CPU of the machine that builds it. An x86-64 build is one APE file for Linux, macOS and Windows. An AArch64 build serves Linux and macOS: Cosmopolitan does not support Windows on ARM. [Platform status](#platform-status) lists what has been verified.
+The executable is built with [Cosmopolitan Libc](https://github.com/jart/cosmopolitan)'s `cosmocc` (GCC 14 and GNU binutils), from upstream Zephyr v4.5.0 plus `zephyr.patch`. Linux, macOS and Windows build it, each for its own OS and CPU, in its own executable format. With `COSMOCC_PORTABLE=1`, the x86-64 build is instead one file for Linux, macOS and Windows, and the AArch64 build one for Linux and macOS. Cosmopolitan does not support Windows on ARM.
 
 ## Workload
 
 Each device has three threads: a 100 ms heartbeat, deterministic multicast work every 10-100 ms, and an event/ACK receiver. The host delays messages by 1-10 ms. Devices run serially. Each grant ends after equal-time hardware events. The host omits idle grants and catches up each device's clock before input delivery.
 
-Each result contains 20 rows: acknowledged events and the last heartbeat that the world received. It also contains the complete traffic's FNV-1a hash and message count. Every timed result must match an always-ticked reference. NCT emulates Zephyr threads. NCE emulates CPU halt/wake. The three coroutine primitives share the same NCT/NCE implementation. Floating-point environment, errno, and C++ exception context preservation remain enabled.
+Each result contains 20 rows: acknowledged events and the last heartbeat that the world received. It also contains the complete traffic's FNV-1a hash and message count. The CPU and thread emulation run either on host threads (pthreads, upstream) or as coroutines on one host thread.
 
-The minute result is `trace ff72adfdb93a52fe 143218`, checksum `1801075893`. The hour result is `trace 3f3db497f9b30aeb 8571855`, checksum `1796618671`. Both are in `reference/`.
+The minute result is `trace ff72adfdb93a52fe 143218`, checksum `1801075893`. The hour result is `trace 3f3db497f9b30aeb 8571855`, checksum `1796618671`. Both outputs are in `reference/`.
 
 ## Run
 
-Build on Linux, x86-64 or AArch64. The build needs CMake, Ninja, GNU make, Python with Zephyr's base packages, curl and unzip. `cosmocc` supplies the compiler and binutils: `scripts/cosmocc.sh` downloads the pinned release from GitHub and verifies its SHA-256. Use a plain upstream Zephyr v4.5.0 checkout. No west modules are needed.
+Linux or macOS, x86-64 or AArch64. Windows (Git Bash, x86-64) is meant to work too, but is untested. You need CMake, Ninja, Python with Zephyr's base packages, curl and unzip, and for `./run.sh zephyr`, twister's packages (see the workflow). `run.sh` downloads `cosmocc` 4.0.2 and checks its SHA-256.
 
 ```sh
+git -C /path/to/zephyr-v4.5.0 apply "$PWD/zephyr.patch"
 export ZEPHYR_BASE=/path/to/zephyr-v4.5.0
-./run.sh                          # build, validate, five one-minute samples per backend
-./run.sh build                    # Linux only
-./run.sh validate bench           # Linux or macOS, with the binaries built above
-SIM_US=600000000 BASELINE=/old/build ./run.sh bench   # also time the previous run.sh's binaries
+./run.sh                  # build, check, and time five one-minute worlds per backend
+./run.sh check bench      # again, without rebuilding
+./run.sh zephyr           # Zephyr samples and test suites, built with cosmocc, run by twister
+COSMOCC_PORTABLE=1 ./run.sh build              # portable executables instead
+RUNNER_CFLAGS=-DCORO_SAVE_CONTEXT ./run.sh build   # coroutines with per-thread errno, FP and C++ state
 ```
 
-`build/<arch>/<backend>/simulator.com` is the executable. On x86-64 it is an APE file: run it directly on Linux, macOS or Windows. On AArch64, Cosmopolitan produces an ELF file: Linux runs it directly, and macOS runs it through Cosmopolitan's APE loader (`run.sh` builds it from `ape-m1.c`). On macOS, build in Linux, for example with `tools/container/Dockerfile` and the host's native platform, then run `validate` and `bench` on macOS.
+With the patch, a native_sim application builds the usual way, e.g. `cmake -S samples/hello_world -B build -GNinja -DBOARD=native_sim/native/64 -DZEPHYR_TOOLCHAIN_VARIANT=cosmocc -DCOSMOCC_TOOLCHAIN_PATH=<cosmocc> && cmake --build build`. The result is `build/zephyr/zephyr.exe`, with its symbols in `zephyr.exe.dbg`. Twister runs native_sim tests with `ZEPHYR_TOOLCHAIN_VARIANT=cosmocc`.
 
-Bash measures the complete process, including boot, hashing, output, and exit. There is no LTO. RT is simulated **world time divided by wall time**, not accumulated device-seconds.
+The case study's executable is `build/<backend>/simulator.exe`. `.github/workflows/build-and-run.yml` builds, checks and times it, and runs the Zephyr tests, on every GitHub runner OS and CPU.
 
-## Build pipeline
+## How it works
 
-```
- app/ (firmware sources, prj.conf: CONFIG_BUILD_OUTPUT_EXE=n)
-   │  stage 1  scripts/build-firmware.sh — once per application
-   ▼
- firmware.o (Zephyr's prelinked zephyr.elf)  +  nsi_config (its runner configuration)
-   │  stage 2  scripts/assemble.sh — once per runner backend
-   │    runner.a      upstream native simulator runner + app/runner.c, built by cosmocc
-   │                  (optionally with runner/coro replacing nct.o/nce.o)
-   │    firmware.o    hidden symbols localized (as the native simulator does)
-   │    image.o       ld -r firmware + runner, NSI registration sections bounded inside,
-   │                  then every symbol localized
-   │    instance_N.o  one copy per device
-   ▼
- simulator.com = cosmocc simulator.c instance_0.o … instance_19.o
-```
+**Zephyr** (`zephyr.patch`) gains a `cosmocc` toolchain variant:
+- It selects cosmocc's GCC and binutils for the host's CPU, with Cosmopolitan's ABI flags.
+- It builds the native simulator runner with cosmocc's driver, for Cosmopolitan Libc.
+- Zephyr's own code uses Zephyr's minimal C library, with native_sim's usual 16 KiB heap. cosmocc has no freestanding `stddef.h` or `stdarg.h`, so the variant adds them where GCC looks for its own headers.
+- Executables are for the build host only, in its format:
+  - **Linux:** ELF, from cosmocc's Linux-only (`-moptlinux`) libraries.
+  - **Windows:** PE.
+  - **x86-64 macOS:** Mach-O, converted with cosmocc's `assimilate`.
+  - **Apple Silicon:** cosmocc cannot produce a native executable there. `zephyr.exe` is a script that starts `zephyr.exe.dbg` through Cosmopolitan's loader.
+  - **`COSMOCC_PORTABLE`:** Actually Portable Executables instead.
+- Outside Windows, CMake cannot start Cosmopolitan's tools directly: the variant adds shell launchers to the cosmocc tree.
+- Zephyr also accepts macOS and Windows build hosts when the target host is explicit, as with cosmocc.
+- For the usual single-image `zephyr.exe`:
+  - The native simulator passes its `INSERT` linker scripts with `-Wl,-T`, so that they precede cosmocc's own script.
+  - Its board script keeps only allocated `symbol_to_keep` sections: an empty, unallocated one had pulled other empty sections into the middle of memory.
+  - The init-priority check reads `zephyr.exe.dbg`.
+  - `nsi_errno.c`'s table is no longer `const`, because Cosmopolitan's errno values are variables.
+- Twister builds native_sim with the variant when selected, and runs it on macOS and Windows too.
 
-1. **Toolchain** (`scripts/cosmocc.sh`, `cosmo/`). `cosmocc` 4.0.2. The host CPU selects `x86_64-linux-cosmo-` or `aarch64-linux-cosmo-` tools. Two adjustments to the private copy:
-   - `cosmocc` ships no GCC-private headers. Its own `stddef.h` and `stdarg.h` include the whole C library. Zephyr builds freestanding, so `cosmo/freestanding/` restores minimal versions in GCC's normal place, `lib/gcc/<arch>-linux-cosmo/14.1.0/include`. Zephyr's `--print-file-name=include/stddef.h` probe then works unchanged.
-   - CMake and make exec tools directly. Without an APE `binfmt_misc` handler, Linux refuses APE files, so the tools are converted with `cosmocc`'s `assimilate`.
-2. **Firmware** (`scripts/build-firmware.sh`, `cosmo/cosmo.cmake`). Zephyr already supports `ZEPHYR_TOOLCHAIN_VARIANT=cross-compile` with `NATIVE_TARGET_HOST` for native_sim. `cosmo.cmake` selects `CROSS_COMPILE=<cosmocc>/bin/<arch>-linux-cosmo-` with it. It adds Cosmopolitan's ABI flags to every Zephyr object:
-   - x86-64: `-mno-red-zone -mno-tls-direct-seg-refs`.
-   - AArch64: `-ffixed-x18 -ffixed-x28 -fsigned-char`.
-   The firmware uses Zephyr's minimal libc, as before. The firmware is compiled with `cosmocc`'s GCC, not with the `cosmocc` wrapper: the wrapper's Cosmopolitan include path would replace Zephyr's libc headers. `CONFIG_BUILD_OUTPUT_EXE=n` already leaves exactly the required artifact, `zephyr.elf`: a relocatable partial link of all Zephyr code, with Zephyr's iterable sections bounded and the runner interface undefined.
-3. **Assembly** (`scripts/assemble.sh`). The upstream native simulator Makefile builds the runner (`runner_lib`). Its compiler is the `cosmocc` wrapper, `<arch>-unknown-cosmo-cc`, so the runner uses Cosmopolitan Libc. Localization and the partial link use the native simulator's own options and linker script, with `cosmocc`'s `objcopy` and `ld.bfd`. The script fails if an image still defines a global symbol, or if it lacks its instance table. The final `cosmocc` link concatenates the 20 `instances` sections. `simulator.c` checks the linker-generated bounds before booting.
+`CONFIG_BUILD_OUTPUT_EXE=n` leaves the firmware as `zephyr.elf`: a partially linked object, with Zephyr's iterable sections already bounded.
 
-The firmware build does not depend on the backend or on the number of instances. Assembly takes one firmware directory per instance, so different applications can share one world.
+**Assembly** (`scripts/assemble.sh`) reads the firmware's runner configuration, `zephyr/NSI/nsi_config`:
+1. Compile the upstream native simulator runner and `app/runner.c`. The coroutine backend replaces `nce.c` and `nct.c` with `runner/coro.c` and `runner/coro.S`.
+2. Localize the firmware's hidden symbols, as the native simulator does.
+3. Link firmware and runner into one relocatable image with `ld -r`. The runner's linker script bounds the NSI registration sections inside the image.
+4. Localize every symbol, and fail if any global definition remains.
+5. Link the image 20 times with `simulator.c`. The linker collects the 20 `instances` tables into one array, and `simulator.c` checks that there are 20.
 
-## Design
+**Coroutines** (`runner/coro.c`, `runner/coro.S`). The CPU and each Zephyr thread are stackful coroutines on the host thread. A switch saves the callee-saved registers. By default, all coroutines share the host thread's errno, floating-point environment and C++ exception state:
+- If firmware changes the rounding mode, exception masks or flush-to-zero, that change also affects every other thread and device.
+- Exception flags are shared.
+- Zephyr's own errno is per thread, so the shared host errno does not affect it.
 
-**Zephyr changes: none.** Upstream v4.5.0 provides everything: the cross-compile toolchain variant for native_sim, `CONFIG_BUILD_OUTPUT_EXE=n`, `NSI_NO_MAIN`, and a Makefile whose tool variables can be overridden. Cosmopolitan performs the host OS adaptation that the previous fork did in Zephyr and the native simulator (Mach-O sections, constructors, symbol localization, semaphores). The previous fork changed 78 files.
+`-DCORO_SAVE_CONTEXT` restores the strict behaviour of host threads: each coroutine saves and restores its own errno, floating-point environment and C++ exception state, inheriting its creator's.
 
-**Coroutines live in the case study.** Upstream v4.5.0 has only the pthread NCT/NCE. `runner/coro/` carries the coroutine NCT/NCE and three primitives from the previous branch. Assembly replaces `nct.o`, and with coroutine NCE also `nce.o`, in a copy of the upstream `runner.a`. Each instance still has its own private runner. Changes from the previous branch:
-- The Mach-O and i386 assembly were removed: Cosmopolitan objects are always ELF.
-- The AArch64 assembly primitive now starts each coroutine with its creator's `x28`. Cosmopolitan keeps the TLS pointer there. A zero `x28` crashed at the first `errno` access.
-- Two Cosmopolitan 4.0.2 x86-64 bugs are worked around (see [below](#cosmopolitan-issues-found)): the saved floating-point environment has 64 bytes of room, and `swapcontext()`'s result is not checked.
-- Boost.Context is not built: Cosmopolitan has no Boost package, and the assembly primitive covers the same ground.
+**Guest adapter** (`app/runner.c`). Each device exports `boot`, `now`, `advance`, `attach`, `interrupt` and `state`. `simulator.c` decides when devices run, catches idle devices up, and delivers input.
 
-**Minimal guest adapter.** `app/runner.c` exports generic controls: `boot`, `now`, `advance`, `attach`, `interrupt` and `state`, plus the mailbox that the firmware uses. `simulator.c` now owns the orchestration: catching up idle devices, input visibility and the RPC interrupt.
+## Checks
 
-**Portable code generation.** The previous builds used `-march=native`/`-mcpu=native`. These builds use `-O3` only (`OPT`), because the executable is meant to run on other machines.
+`./run.sh check` requires byte-identical output to both references, for both backends. The minute is also checked in the always-ticked reference mode. This has passed on Linux x86-64 (Intel N100), Linux AArch64 and macOS AArch64 (Apple M1). Windows has not been run yet.
 
-## Validation
+`./run.sh zephyr` runs twister on 3 samples and 16 ztest suites (kernel threads, scheduling, timers, synchronization, queues, work queues, memory slabs, C library, and more): 62 test configurations. All executed configurations and test cases passed:
+- **macOS AArch64**, built on macOS: 47 configurations, 1,119 test cases.
+- **Linux AArch64 and x86-64**: 45 configurations, 1,039 test cases.
 
-`scripts/validate.sh` checks every backend. `run.sh validate` runs it for all seven:
-- **Determinism.** Output is byte-identical to `reference/60000000.txt`, and to `reference/3600000000.txt` with `FULL=1`. The always-ticked run is identical too.
-- **Kernel scheduling and timers.** Every device's heartbeat reached 59 900 ms, and the acknowledgement counts differ per device.
-- **Symbol isolation.** Each of these symbols exists 20 times, at 20 distinct addresses, all local, and never global: Zephyr kernel state (`_kernel`, `z_main_thread`, static thread objects), application state, the RPC message queue, runner state, NSI registration bounds, and NCT/NCE instances. Assembly also checks that each image defines no global symbol.
-- **Threading (Linux).** The host thread count while running: pthreads 81 (main + 20 × (CPU + 3 threads)), coroutine NCT 21 (main + 20 CPU threads), coroutine NCT and NCE 1.
-
-## Platform status
-
-| Platform | Build | Result |
-|---|---|---|
-| Linux x86-64 (Intel N100, Ubuntu 26.04) | native | all 7 backends pass `validate`, including the one-hour reference |
-| Linux AArch64 (Apple M1, Docker, Ubuntu 24.04) | native | all 7 backends pass `validate`, including the one-hour reference |
-| macOS AArch64 (Apple M1, macOS 27.2) | Linux AArch64 build, APE loader | all 7 backends pass `validate` (no thread count on macOS) |
-| macOS x86-64 under Rosetta 2 | Linux x86-64 build | coroutine NCE backends match the reference; pthread NCE backends spin and never finish |
-| Windows x86-64 | Linux x86-64 build | not yet run: see `.github/workflows/cosmopolitan.yml` |
-| Windows on ARM | — | no native build: Cosmopolitan 4.0.2 supports only Linux, macOS and FreeBSD on AArch64 (`libc/dce.h`), and its AArch64 output is ELF. CI runs the x86-64 APE under x64 emulation, labeled and non-blocking |
-
-Linux under Docker Desktop's Rosetta (`linux/amd64` on Apple Silicon) cannot run any Cosmopolitan x86-64 program, not even `cosmocc`'s own tools: they segfault at start.
+Twister filtered the rest, for example picolibc variants.
 
 ## Measurements
 
-Each value is the median of five complete runs of a 10-minute world, alternating the order between samples. "Previous" is the pre-Cosmopolitan implementation: this repository's previous `run.sh`, app and `simulator.c`, Zephyr fork `a97d7e5a961`, host GCC or Clang with `-march=native`/`-mcpu=native`. Its outputs were byte-identical to the Cosmopolitan builds. Boost.Context is not in either column. **Previous / Cosmopolitan** above 1 means the Cosmopolitan build is faster.
+Previous: this repository's earlier `run.sh`, app and `simulator.c`, with Zephyr fork `a97d7e5a961` and host GCC or Clang at `-march=native`/`-mcpu=native`. Its coroutine column is the assembly primitive, which also saved the floating-point environment and errno on every switch. Cosmopolitan: these builds, at generic `-O3`. Each value is the median wall time of five 10-minute worlds, run interleaved. All 40 outputs per machine were identical.
 
-### Linux: Intel N100, Ubuntu 26.04, GCC 15.2 (previous) and cosmocc GCC 14.1
+| Machine | Backend | Previous s | Cosmopolitan s | RT | Previous / Cosmopolitan |
+|---|---|---:|---:|---:|---:|
+| Intel N100, Linux, CPU 0 | pthreads | 16.677 | 17.122 | 35x | 0.97x |
+| Intel N100, Linux, CPU 0 | coroutines | 1.915 | 1.049 | 572x | **1.83x** |
+| Intel N100, Linux, unpinned | pthreads | 20.996 | 21.047 | 29x | 1.00x |
+| Intel N100, Linux, unpinned | coroutines | 1.918 | 1.050 | 571x | **1.83x** |
+| Apple M1, macOS, unpinned | pthreads | 10.865 | 9.679 | 62x | 1.12x |
+| Apple M1, macOS, unpinned | coroutines | 0.619 | 0.538 | 1115x | **1.15x** |
 
-The other load was an idle Windows guest VM. Pinned to CPU 0 (`PIN="taskset -c 0"`):
+RT is simulated world time divided by wall time. The N100 also ran an idle Windows virtual machine. These Cosmopolitan builds were portable executables.
 
-| NCT | NCE | Primitive | Previous s | Cosmopolitan s | Cosmopolitan RT | Cosmopolitan speedup | Previous / Cosmopolitan |
-|---|---|---|---:|---:|---:|---:|---:|
-| pthreads | pthreads | — | 16.810 | 17.319 | 34.6x | 1.00x | **0.97x** |
-| coroutines | pthreads | ucontext | 10.318 | 9.708 | 61.8x | 1.78x | **1.06x** |
-| coroutines | pthreads | makecontext + _longjmp | 8.803 | 8.229 | 72.9x | 2.10x | **1.07x** |
-| coroutines | pthreads | Assembly | 7.602 | 7.432 | 80.7x | 2.33x | **1.02x** |
-| coroutines | coroutines | ucontext | 3.810 | 2.985 | 201.0x | 5.80x | **1.28x** |
-| coroutines | coroutines | makecontext + _longjmp | 2.166 | 1.725 | 347.8x | 10.04x | **1.26x** |
-| coroutines | coroutines | Assembly | 1.913 | 1.516 | 395.8x | 11.42x | **1.26x** |
+Build options, on the N100 pinned to CPU 0, with the same method:
 
-Unpinned:
+| Build | pthreads s | coroutines s |
+|---|---:|---:|
+| Default: Linux-only ELF (`-moptlinux`) | 17.220 | 1.045 |
+| `COSMOCC_PORTABLE=1` | 17.330 | 1.050 |
+| `RUNNER_CFLAGS=-DCORO_SAVE_CONTEXT` | — | 1.550 |
 
-| NCT | NCE | Primitive | Previous s | Cosmopolitan s | Cosmopolitan RT | Cosmopolitan speedup | Previous / Cosmopolitan |
-|---|---|---|---:|---:|---:|---:|---:|
-| pthreads | pthreads | — | 20.962 | 20.989 | 28.6x | 1.00x | **1.00x** |
-| coroutines | pthreads | ucontext | 12.141 | 11.615 | 51.7x | 1.81x | **1.05x** |
-| coroutines | pthreads | makecontext + _longjmp | 11.075 | 10.633 | 56.4x | 1.97x | **1.04x** |
-| coroutines | pthreads | Assembly | 10.897 | 10.550 | 56.9x | 1.99x | **1.03x** |
-| coroutines | coroutines | ucontext | 3.807 | 2.994 | 200.4x | 7.01x | **1.27x** |
-| coroutines | coroutines | makecontext + _longjmp | 2.168 | 1.726 | 347.6x | 12.16x | **1.26x** |
-| coroutines | coroutines | Assembly | 1.915 | 1.518 | 395.3x | 13.83x | **1.26x** |
+The Linux-only libraries gain less than 1%. Saving the floating-point environment on every switch costs 48% on x86-64, because `fegetenv` and `fesetenv` are slow there. Even so, the strict coroutines remain 1.24x faster than the previous implementation's, which did the same. On the M1, they cost 5%.
 
-The previous column reproduces the historical one-hour table below: 16.81 s per 10 minutes against 99.96 s per hour for pinned pthreads, and 1.91 s against 11.80 s for Assembly.
+## Notes
 
-### macOS: Apple M1, macOS 27.2, Apple Clang (previous) and cosmocc GCC 14.1
-
-Native arm64, unpinned. The Cosmopolitan build is the Linux AArch64 executable, run through the APE loader. Other applications ran throughout.
-
-| NCT | NCE | Primitive | Previous s | Cosmopolitan s | Cosmopolitan RT | Cosmopolitan speedup | Previous / Cosmopolitan |
-|---|---|---|---:|---:|---:|---:|---:|
-| pthreads | pthreads | — | 11.021 | 10.344 | 58.0x | 1.00x | **1.07x** |
-| coroutines | pthreads | ucontext | 8.127 | 6.228 | 96.3x | 1.66x | **1.30x** |
-| coroutines | pthreads | makecontext + _longjmp | 5.786 | 5.584 | 107.4x | 1.85x | **1.04x** |
-| coroutines | pthreads | Assembly | 5.588 | 5.453 | 110.0x | 1.90x | **1.02x** |
-| coroutines | coroutines | ucontext | 4.478 | 1.847 | 324.9x | 5.60x | **2.42x** |
-| coroutines | coroutines | makecontext + _longjmp | 0.773 | 0.678 | 885.0x | 15.26x | **1.14x** |
-| coroutines | coroutines | Assembly | 0.645 | 0.577 | 1039.9x | 17.93x | **1.12x** |
-
-### Linux AArch64: Apple M1, Docker Desktop, Ubuntu 24.04, GCC 13.3 (previous) and cosmocc GCC 14.1
-
-One-minute worlds. Docker's virtual machine makes the pthread backends syscall-bound.
-
-| NCT | NCE | Primitive | Previous s | Cosmopolitan s | Cosmopolitan RT | Cosmopolitan speedup | Previous / Cosmopolitan |
-|---|---|---|---:|---:|---:|---:|---:|
-| pthreads | pthreads | — | 7.508 | 7.512 | 8.0x | 1.00x | **1.00x** |
-| coroutines | pthreads | ucontext | 4.151 | 3.914 | 15.3x | 1.92x | **1.06x** |
-| coroutines | pthreads | makecontext + _longjmp | 3.774 | 3.751 | 16.0x | 2.00x | **1.01x** |
-| coroutines | pthreads | Assembly | 3.715 | 3.780 | 15.9x | 1.99x | **0.98x** |
-| coroutines | coroutines | ucontext | 0.308 | 0.196 | 306.1x | 38.33x | **1.57x** |
-| coroutines | coroutines | makecontext + _longjmp | 0.093 | 0.072 | 833.3x | 104.33x | **1.29x** |
-| coroutines | coroutines | Assembly | 0.073 | 0.063 | 952.4x | 119.24x | **1.16x** |
-
-### Cosmopolitan nightly
-
-The nightly `cosmocc` of 2026-11-09 (master `aefad27`, GCC 14.1.0) changes none of the above:
-- Its AArch64 support is still Linux, macOS and FreeBSD only, so there is no Windows on ARM build.
-- Both x86-64 bugs below still occur.
-- It passes every check, including the one-hour reference on x86-64.
-- It is not faster. Against 4.0.2 (10-minute worlds, five samples, the 4.0.2 build as the baseline column): N100 pinned to CPU 0, 0.93-0.97x with pthread NCE and 0.98-1.00x with coroutine NCE; M1 macOS 0.96-1.00x.
-
-So `scripts/cosmocc.sh` stays pinned to the 4.0.2 release, which anyone can download without GitHub authentication. Another archive can be tried with `COSMOCC_VERSION=<name> COSMOCC_ZIP=<archive> COSMOCC_SHA256=<hash>`.
-
-## Cosmopolitan issues found
-
-Both are in Cosmopolitan Libc 4.0.2 and in the 2026-11-09 nightly, on x86-64 only. Both are worked around in `runner/coro/`:
-- `fenv_t` is declared as `void *` (8 bytes), but `fegetenv()` stores 32 bytes (`fnstenv` plus `stmxcsr`). The coroutine context reserves 64 bytes for it. Without that, every coroutine backend crashed. AArch64 stores exactly 8 bytes.
-- A resumed `swapcontext()` returns the `%rax` value of its original call, not 0. `getcontext` saves `%rax`, and `__tailcontext` restores it. The ucontext primitive no longer checks the result.
-
-## Continuous integration
-
-`.github/workflows/cosmopolitan.yml` builds and validates on six Ubuntu runners: 22.04, 24.04 and 26.04, each on x86-64 and on ARM. Then it validates and times the Ubuntu 24.04 builds on every runner OS: Ubuntu, Windows 2022/2025, Windows 11 on ARM (emulated x86-64, non-blocking), macOS 15/26 on Intel and on Apple Silicon, and Xcode 27. A final job lists each build host's executable hashes. `workflow_dispatch` with `full` also checks the 10-minute and one-hour references.
-
-## Limitations
-
-- **Build host.** Building needs Linux. Upstream `arch/posix/CMakeLists.txt` rejects other hosts, even though `cosmocc` itself runs on macOS and Windows. Allowing macOS hosts for the cross-compile variant would be a one-line upstream change.
-- **CPU.** One build serves one CPU architecture: no fat binaries. Windows on ARM has no native build.
-- **Boost.Context.** Not available: there is no Cosmopolitan build of Boost.
-- **Portable code generation.** The previous column had `-march=native`. These builds are generic `-O3`. Set `OPT` to choose otherwise.
+- **64-bit only.** cosmocc builds 64-bit programs: use `native_sim/native/64`. Zephyr's code uses its minimal C library; picolibc would need more freestanding headers.
+- **Single-OS builds.** Only Linux has an OS-specific Cosmopolitan Libc (`-moptlinux`). On macOS and Windows, the executable has the host's format, but its library still contains the code for the other operating systems.
+- **Cosmopolitan 4.0.2 on x86-64.** `fenv_t` is 8 bytes, but `fegetenv()` writes 32. A resumed `swapcontext()` returns a stale `%rax` instead of 0. This code calls neither. The 2026-11-09 nightly has both bugs, still lacks Windows on ARM, and was no faster.
+- **Rosetta.** Cosmopolitan x86-64 programs crash under Docker Desktop's Rosetta for Linux. Under macOS Rosetta, pthread backends never finish.
 
 ## Historical one-hour measurements — before Cosmopolitan
 
-These tables describe the patched-Zephyr versions that preceded the Cosmopolitan build, measured with the previous `run.sh` (`git show ccfcaee:run.sh`). Each value is the median of five complete one-hour runs. All samples remain in the medians.
+These tables describe the patched-Zephyr versions that preceded the Cosmopolitan build, measured with the original `run.sh` (`git show ccfcaee:run.sh`). Each value is the median of five complete one-hour runs. All samples remain in the medians.
 
 ### Linux: Intel N100, Ubuntu 26.04, GCC 15.2
 

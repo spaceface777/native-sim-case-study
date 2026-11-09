@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# Every runner builds the world for its own OS and CPU, then checks and times it. It also
+# builds and runs Zephyr's own samples and test suites as ordinary native_sim executables.
+# Cosmopolitan has no Windows on ARM support: those runners build and run x86-64 under
+# emulation, without failing the workflow.
+name: Build and run
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  run:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04, ubuntu-22.04-arm, ubuntu-24.04-arm,
+             ubuntu-26.04-arm, windows-2022, windows-2025, windows-11-arm, windows-11-vs2026-arm,
+             macos-15-intel, macos-26-intel, macos-15, macos-26, xcode-27]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ startsWith(matrix.os, 'windows') && endsWith(matrix.os, '-arm') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: zephyrproject-rtos/zephyr
+          ref: v4.5.0
+          path: zephyr
+          fetch-depth: 1
+      - name: Install Zephyr's requirements
+        run: |
+          git -C zephyr apply ../zephyr.patch
+          $([[ $RUNNER_OS == Windows ]] && echo python || echo python3) -m venv venv
+          . venv/*/activate
+          pip install cmake ninja pyelftools pyyaml pykwalify packaging jsonschema \
+            pytest tabulate natsort psutil colorama ply junitparser python-dotenv anytree
+      - uses: actions/cache@v4
+        with:
+          path: build/cosmocc-4.0.2.zip
+          key: cosmocc-4.0.2
+      - name: Build
+        run: . venv/*/activate && ZEPHYR_BASE="$PWD/zephyr" ./run.sh build
+      - name: Check and time
+        run: ./run.sh check bench | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Zephyr samples and tests, with twister
+        run: . venv/*/activate && ZEPHYR_BASE="$PWD/zephyr" ./run.sh zephyr

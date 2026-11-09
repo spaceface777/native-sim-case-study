@@ -1,0 +1,490 @@
+From bfebbcdadbfebecbebadbf42ace0422f57c25240 Mon Sep 17 00:00:00 2001
+From: Raul Hernandez <me@spaceface.dev>
+Date: Mon, 9 Nov 2026 17:47:17 +0100
+Subject: [PATCH] native_sim: add the cosmocc toolchain
+
+cosmocc is GCC and GNU binutils for Cosmopolitan Libc. With it,
+native_sim builds and runs on Linux and macOS (x86-64 and AArch64) and
+on Windows (x86-64), and twister runs native_sim tests there.
+
+cmake/toolchain/cosmocc:
+- Select cosmocc's GCC and binutils for the host's CPU, 64-bit only,
+  with Cosmopolitan's ABI flags.
+- Zephyr's code uses Zephyr's minimal C library, with a 16 KiB heap as
+  native_sim has with its other C libraries. cosmocc has no freestanding
+  stddef.h or stdarg.h: they are added where GCC looks for them.
+  Picolibc would need more, so it is not supported.
+- Build the native simulator runner with cosmocc's driver, for
+  Cosmopolitan Libc.
+- Executables are for the build host only, in its native format: ELF
+  linked with cosmocc's Linux-only libraries on Linux, PE on Windows,
+  Mach-O on x86-64 macOS. On Apple Silicon, which cosmocc cannot target
+  natively, zephyr.exe is a script that starts zephyr.exe.dbg through
+  Cosmopolitan's loader. COSMOCC_PORTABLE instead builds Actually
+  Portable Executables, for all of cosmocc's operating systems.
+- Outside Windows, CMake starts cosmocc's tools through shell launchers.
+  These, and the headers, are added to the cosmocc tree once.
+
+Elsewhere:
+- FindHostTools: keep the cosmocc variant for native targets.
+- arch/posix: allow other build hosts when cross-compiling for an
+  explicit NATIVE_TARGET_HOST.
+- natsim_config: let a toolchain choose the runner's compiler driver,
+  and how it links executables (NSI_LINKER).
+- Pass the native simulator's INSERT linker scripts with -Wl,-T, not -T:
+  GCC moves -T options after all others, behind cosmocc's own linker
+  script, where GNU ld cannot insert into it. Otherwise, it is the same.
+- natsim_linker_script.ld: keep only allocated symbol_to_keep sections.
+  An empty one is not allocated (zephyr.elf is a partial link), and
+  it drew other unallocated sections amid the program's memory.
+- Check init priorities in the executable's symbols, which cosmocc
+  writes to zephyr.exe.dbg.
+- nsi_errno.c: the errno table is not const, as Cosmopolitan's errno
+  values are variables.
+- twister: build posix platforms with the cosmocc variant when selected,
+  run native platforms on macOS and Windows with it, and list it for
+  native_sim/native/64.
+---
+ CMakeLists.txt                                |   2 +-
+ arch/posix/CMakeLists.txt                     |   4 +-
+ boards/native/common/natsim_config.cmake      |  15 ++-
+ boards/native/common/natsim_linker_script.ld  |   5 +-
+ boards/native/native_sim/twister.yaml         |   4 +
+ cmake/modules/FindHostTools.cmake             |   5 +-
+ cmake/toolchain/cosmocc/Kconfig.defconfig     |  15 +++
+ cmake/toolchain/cosmocc/generic.cmake         | 120 ++++++++++++++++++
+ cmake/toolchain/cosmocc/include/stdarg.h      |  16 +++
+ cmake/toolchain/cosmocc/include/stddef.h      |  34 +++++
+ cmake/toolchain/cosmocc/target.cmake          |  16 +++
+ scripts/native_simulator/Makefile             |   2 +-
+ .../native_simulator/common/src/nsi_errno.c   |   3 +-
+ .../pylib/twister/twisterlib/testinstance.py  |   4 +-
+ scripts/pylib/twister/twisterlib/testplan.py  |   6 +-
+ 15 files changed, 238 insertions(+), 13 deletions(-)
+ create mode 100644 cmake/toolchain/cosmocc/Kconfig.defconfig
+ create mode 100644 cmake/toolchain/cosmocc/generic.cmake
+ create mode 100644 cmake/toolchain/cosmocc/include/stdarg.h
+ create mode 100644 cmake/toolchain/cosmocc/include/stddef.h
+ create mode 100644 cmake/toolchain/cosmocc/target.cmake
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c759db57407..0e479adb832 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2159,7 +2159,7 @@ endif()
+ 
+ if(NOT CMAKE_C_COMPILER_ID STREQUAL "ARMClang")
+   set(check_init_priorities_input
+-      $<IF:$<TARGET_EXISTS:native_runner_executable>,${BYPRODUCT_KERNEL_EXE_NAME},${BYPRODUCT_KERNEL_ELF_NAME}>
++      $<IF:$<TARGET_EXISTS:native_runner_executable>,${BYPRODUCT_KERNEL_EXE_NAME}${NATIVE_EXE_SYMBOLS_SUFFIX},${BYPRODUCT_KERNEL_ELF_NAME}>
+   )
+   set(check_init_priorities_command
+       ${PYTHON_EXECUTABLE} ${ZEPHYR_BASE}/scripts/build/check_init_priorities.py
+diff --git a/arch/posix/CMakeLists.txt b/arch/posix/CMakeLists.txt
+index 2d2939b4381..e88dfe58c3c 100644
+--- a/arch/posix/CMakeLists.txt
++++ b/arch/posix/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-if(NOT CMAKE_HOST_UNIX OR CMAKE_HOST_APPLE)
++# Other hosts can build when cross-compiling for an explicit NATIVE_TARGET_HOST, e.g. with
++# cosmocc, whose executables also run on macOS and Windows.
++if((NOT CMAKE_HOST_UNIX OR CMAKE_HOST_APPLE) AND NOT DEFINED NATIVE_TARGET_HOST)
+   message(FATAL_ERROR "The POSIX architecture only works on Linux. If on Windows or macOS "
+           "consider using a virtual machine to run a Linux guest.")
+ endif()
+diff --git a/boards/native/common/natsim_config.cmake b/boards/native/common/natsim_config.cmake
+index 766937fb8e3..1fa9f448233 100644
+--- a/boards/native/common/natsim_config.cmake
++++ b/boards/native/common/natsim_config.cmake
+@@ -4,7 +4,7 @@
+ set(zephyr_build_path ${APPLICATION_BINARY_DIR}/zephyr)
+ 
+ target_link_options(native_simulator INTERFACE
+-  "-T ${ZEPHYR_BASE}/boards/native/common/natsim_linker_script.ld")
++  "-Wl,-T,${ZEPHYR_BASE}/boards/native/common/natsim_linker_script.ld")
+ 
+ if(SYSROOT_DIR)
+   message(NOTICE "Appending --sysroot=${SYSROOT_DIR} to native_simulator")
+@@ -18,6 +18,12 @@ endif()
+ 
+ list(JOIN CMAKE_C_COMPILER_LAUNCHER " " launcher)
+ 
++# The runner is built against the host C library. A toolchain may use another compiler driver
++# for that than for the embedded code (cosmocc: Cosmopolitan Libc's).
++if(NOT DEFINED NATIVE_RUNNER_C_COMPILER)
++  set(NATIVE_RUNNER_C_COMPILER ${CMAKE_C_COMPILER})
++endif()
++
+ if("${LINKER}" STREQUAL "lld")
+   target_link_options(native_simulator INTERFACE "-fuse-ld=lld")
+ endif()
+@@ -27,7 +33,7 @@ set(nsi_config_content
+   "NSI_AR:=${CMAKE_AR}"
+   "NSI_BUILD_OPTIONS:=$<JOIN:$<TARGET_PROPERTY:native_simulator,INTERFACE_COMPILE_OPTIONS>,\ >"
+   "NSI_BUILD_PATH:=${zephyr_build_path}/NSI"
+-  "NSI_CC:=$<$<BOOL:${launcher}>:${launcher} >${CMAKE_C_COMPILER}"
++  "NSI_CC:=$<$<BOOL:${launcher}>:${launcher} >${NATIVE_RUNNER_C_COMPILER}"
+   "NSI_OBJCOPY:=${CMAKE_OBJCOPY}"
+   "NSI_EMBEDDED_CPU_SW:=${zephyr_build_path}/${KERNEL_ELF_NAME} ${CONFIG_NATIVE_SIMULATOR_EXTRA_IMAGE_PATHS}"
+   "NSI_EXE:=${zephyr_build_path}/${KERNEL_EXE_NAME}"
+@@ -39,6 +45,11 @@ set(nsi_config_content
+   "NSI_LOCALIZE_OPTIONS:=--localize-symbol=CONFIG_* $<JOIN:$<TARGET_PROPERTY:native_simulator,LOCALIZE_EXTRA_OPTIONS>,\ >"
+ )
+ 
++# A toolchain may also link the executable with its own command.
++if(DEFINED NATIVE_RUNNER_LINKER)
++  list(APPEND nsi_config_content "NSI_LINKER:=${NATIVE_RUNNER_LINKER}")
++endif()
++
+ string(REPLACE ";" "\n" nsi_config_content "${nsi_config_content}")
+ 
+ file(GENERATE OUTPUT "${zephyr_build_path}/NSI/nsi_config"
+diff --git a/boards/native/common/natsim_linker_script.ld b/boards/native/common/natsim_linker_script.ld
+index add80b86c75..aa1ed975349 100644
+--- a/boards/native/common/natsim_linker_script.ld
++++ b/boards/native/common/natsim_linker_script.ld
+@@ -13,7 +13,10 @@ SECTIONS
+  {
+ 	symbol_to_keep :
+ 	{
+-		KEEP(*(symbol_to_keep*));
++		/* Only allocated input: an empty one is not (zephyr.elf is a partial link), and it
++		 * would place other empty, unallocated sections amid the program's memory.
++		 */
++		KEEP(INPUT_SECTION_FLAGS(SHF_ALLOC) *(symbol_to_keep*));
+ 	}
+  } INSERT AFTER .data;
+ 
+diff --git a/boards/native/native_sim/twister.yaml b/boards/native/native_sim/twister.yaml
+index 752034123c1..244656b6566 100644
+--- a/boards/native/native_sim/twister.yaml
++++ b/boards/native/native_sim/twister.yaml
+@@ -33,3 +33,7 @@ variants:
+       default: true
+   native_sim/native/64:
+     name: Native Simulation port - 64-bit variant
++    toolchain:
++      - host
++      - llvm
++      - cosmocc
+diff --git a/cmake/modules/FindHostTools.cmake b/cmake/modules/FindHostTools.cmake
+index 944ba887a4a..cc501356c67 100644
+--- a/cmake/modules/FindHostTools.cmake
++++ b/cmake/modules/FindHostTools.cmake
+@@ -63,11 +63,12 @@ if("${PTY_INTERFACE}" STREQUAL "PTY_INTERFACE-NOTFOUND")
+ endif()
+ 
+ # When targeting a host based target default to the host system's toolchain,
+-# unless the user has selected to build with llvm (which is also valid for hosts builds)
+-# or they are clearly trying to cross-compile a native simulator based target
++# unless the user has selected to build with llvm or cosmocc (which are also valid for host
++# builds) or they are clearly trying to cross-compile a native simulator based target
+ if((${BOARD_DIR} MATCHES "boards\/native") OR ("${ARCH}" STREQUAL "posix")
+    OR ("${BOARD}" STREQUAL "unit_testing"))
+   if((NOT "${ZEPHYR_TOOLCHAIN_VARIANT}" STREQUAL "host/llvm") AND
++     (NOT "${ZEPHYR_TOOLCHAIN_VARIANT}" STREQUAL "cosmocc") AND
+      (NOT ("${ZEPHYR_TOOLCHAIN_VARIANT}" STREQUAL "cross-compile" AND DEFINED NATIVE_TARGET_HOST)))
+     set(ZEPHYR_TOOLCHAIN_VARIANT "host")
+   endif()
+diff --git a/cmake/toolchain/cosmocc/Kconfig.defconfig b/cmake/toolchain/cosmocc/Kconfig.defconfig
+new file mode 100644
+index 00000000000..0a5bb5bbb73
+--- /dev/null
++++ b/cmake/toolchain/cosmocc/Kconfig.defconfig
+@@ -0,0 +1,15 @@
++# SPDX-License-Identifier: Apache-2.0
++
++# Zephyr's code is freestanding, and cosmocc provides only the few headers that Zephyr's
++# minimal C library needs: picolibc needs more. The native simulator runner uses
++# Cosmopolitan Libc.
++choice LIBC_IMPLEMENTATION
++	default MINIMAL_LIBC
++endchoice
++
++config PICOLIBC_SUPPORTED
++	default n
++
++# The heap native_sim has with its other C libraries.
++config COMMON_LIBC_MALLOC_ARENA_SIZE
++	default 16384
+diff --git a/cmake/toolchain/cosmocc/generic.cmake b/cmake/toolchain/cosmocc/generic.cmake
+new file mode 100644
+index 00000000000..e2871131316
+--- /dev/null
++++ b/cmake/toolchain/cosmocc/generic.cmake
+@@ -0,0 +1,120 @@
++# SPDX-License-Identifier: Apache-2.0
++
++# cosmocc: GCC and GNU binutils for Cosmopolitan Libc (https://github.com/jart/cosmopolitan).
++# Set COSMOCC_TOOLCHAIN_PATH to an extracted cosmocc release.
++#
++# By default, native_sim executables are for this host only, in its executable format: ELF
++# built with cosmocc's Linux-only libraries on Linux, Mach-O on x86-64 macOS, PE on Windows.
++# Apple Silicon has no native format for them: zephyr.exe is a script that starts the ELF
++# program, zephyr.exe.dbg, through Cosmopolitan's loader.
++# With COSMOCC_PORTABLE, they are instead Actually Portable Executables: an x86-64 one runs
++# on Linux, macOS and Windows, an AArch64 one on Linux and macOS (on macOS through the loader).
++
++zephyr_get(COSMOCC_TOOLCHAIN_PATH)
++assert(COSMOCC_TOOLCHAIN_PATH "COSMOCC_TOOLCHAIN_PATH is not set")
++zephyr_get(COSMOCC_PORTABLE)
++
++# Build for the host CPU by default. Cosmopolitan supports Windows on x86-64 only.
++if(NOT DEFINED NATIVE_TARGET_HOST)
++  cmake_host_system_information(RESULT host_cpu QUERY OS_PLATFORM)
++  if(CMAKE_HOST_WIN32 OR host_cpu MATCHES "^(x86_64|AMD64|amd64)$")
++    set(NATIVE_TARGET_HOST x86_64)
++  else()
++    set(NATIVE_TARGET_HOST aarch64)
++  endif()
++endif()
++set(cosmocc_triple ${NATIVE_TARGET_HOST}-linux-cosmo)
++set(cosmocc_bin ${COSMOCC_TOOLCHAIN_PATH}/bin)
++if(CMAKE_HOST_UNIX AND NOT CMAKE_HOST_APPLE AND NOT COSMOCC_PORTABLE)
++  set(COSMOCC_LINUX_ONLY TRUE)
++endif()
++
++# Complete cosmocc for Zephyr, in place: the files below are the same for all builds on this
++# host. Write each one only if it differs, atomically, as parallel builds may use them.
++function(cosmocc_install path content)
++  if(EXISTS ${path})
++    file(READ ${path} old)
++    if(old STREQUAL content)
++      return()
++    endif()
++  endif()
++  string(RANDOM LENGTH 8 suffix)
++  file(WRITE ${path}.${suffix} "${content}")
++  if(ARGN STREQUAL "EXECUTABLE")
++    file(CHMOD ${path}.${suffix} FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
++  endif()
++  file(RENAME ${path}.${suffix} ${path})
++endfunction()
++set(cosmocc_dir ${COSMOCC_TOOLCHAIN_PATH}/zephyr)
++
++# cosmocc lacks GCC's freestanding headers (its own include its C library). Zephyr's C
++# library needs them, so put them where GCC looks for its own headers.
++file(GLOB cosmocc_gcc_versions ${COSMOCC_TOOLCHAIN_PATH}/libexec/gcc/${cosmocc_triple}/*)
++foreach(version_dir ${cosmocc_gcc_versions})
++  get_filename_component(version ${version_dir} NAME)
++  foreach(header stddef.h stdarg.h)
++    file(READ ${CMAKE_CURRENT_LIST_DIR}/include/${header} content)
++    cosmocc_install(${COSMOCC_TOOLCHAIN_PATH}/lib/gcc/${cosmocc_triple}/${version}/include/${header}
++                    "${content}")
++  endforeach()
++endforeach()
++
++# Cosmopolitan programs are Windows executables, once named so. Elsewhere, CMake cannot
++# start them without an APE loader registered with the kernel, but any shell can.
++set(cosmocc_tools gcc g++ ar nm objcopy objdump readelf strip ranlib ld.bfd)
++if(CMAKE_HOST_WIN32)
++  set(CROSS_COMPILE ${cosmocc_bin}/${cosmocc_triple}-)
++  foreach(tool ${cosmocc_tools})
++    configure_file(${CROSS_COMPILE}${tool} ${CROSS_COMPILE}${tool}.exe COPYONLY)
++  endforeach()
++else()
++  set(CROSS_COMPILE ${cosmocc_dir}/${cosmocc_triple}-)
++  foreach(tool ${cosmocc_tools})
++    cosmocc_install(${CROSS_COMPILE}${tool}
++      "#!/bin/sh\nexec '${cosmocc_bin}/${cosmocc_triple}-${tool}' \"$@\"\n" EXECUTABLE)
++  endforeach()
++endif()
++
++# Zephyr's code is freestanding. The native simulator runner uses Cosmopolitan Libc, through
++# cosmocc's own compiler driver, which also links the executable.
++set(cosmocc_driver ${cosmocc_bin}/${NATIVE_TARGET_HOST}-unknown-cosmo-cc)
++if(COSMOCC_LINUX_ONLY)
++  set(cosmocc_driver_flags -moptlinux)
++endif()
++set(NATIVE_RUNNER_C_COMPILER "${cosmocc_driver} ${cosmocc_driver_flags}")
++set(NATIVE_RUNNER_LINKER ${NATIVE_RUNNER_C_COMPILER})
++
++# On Linux, the driver's Linux-only executables are ELF, and on Windows its portable ones
++# are PE. On macOS, convert them.
++if(CMAKE_HOST_APPLE AND NOT COSMOCC_PORTABLE)
++  if(NATIVE_TARGET_HOST STREQUAL "aarch64")
++    if(NOT EXISTS ${cosmocc_dir}/ape)
++      string(RANDOM LENGTH 8 suffix)
++      execute_process(COMMAND cc -O2 -o ${cosmocc_dir}/ape.${suffix} ${cosmocc_bin}/ape-m1.c
++                      COMMAND_ERROR_IS_FATAL ANY)
++      file(RENAME ${cosmocc_dir}/ape.${suffix} ${cosmocc_dir}/ape)
++    endif()
++    string(CONCAT convert
++      "printf '#!/bin/sh\\nexec \"%s\" \"$0.dbg\" \"$@\"\\n' '${cosmocc_dir}/ape' >\"$out\"\n"
++      "chmod +x \"$out\"\n")
++  else()
++    set(convert "exec '${cosmocc_bin}/assimilate' -c \"$out\"\n")
++  endif()
++  set(NATIVE_RUNNER_LINKER ${cosmocc_dir}/link)
++  string(CONCAT script "#!/bin/sh\n"
++    "'${cosmocc_driver}' ${cosmocc_driver_flags} \"$@\" || exit\n"
++    "while [ $# -gt 1 ]; do [ \"$1\" != -o ] || out=$2; shift; done\n"
++    "case $out in *.exe | *.com) ;; *) exit 0 ;; esac\n"
++    "${convert}")
++  cosmocc_install(${NATIVE_RUNNER_LINKER} "${script}" EXECUTABLE)
++endif()
++
++set(SYSROOT_DIR ${COSMOCC_TOOLCHAIN_PATH}/${cosmocc_triple})
++# cosmocc's driver writes the executable's symbols to an ELF file with this suffix.
++set(NATIVE_EXE_SYMBOLS_SUFFIX .dbg)
++
++set(COMPILER gcc)
++set(LINKER ld)
++set(BINTOOLS gnu)
++
++message(STATUS "Found toolchain: cosmocc (${COSMOCC_TOOLCHAIN_PATH})")
+diff --git a/cmake/toolchain/cosmocc/include/stdarg.h b/cmake/toolchain/cosmocc/include/stdarg.h
+new file mode 100644
+index 00000000000..e96234b84da
+--- /dev/null
++++ b/cmake/toolchain/cosmocc/include/stdarg.h
+@@ -0,0 +1,16 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Freestanding <stdarg.h> for cosmocc, which has no compiler-provided one.
++ */
++#ifndef ZEPHYR_COSMOCC_STDARG_H_
++#define ZEPHYR_COSMOCC_STDARG_H_
++
++typedef __builtin_va_list __gnuc_va_list; /* As GCC's, used by C libraries */
++typedef __builtin_va_list va_list;
++#define va_start(ap, ...) __builtin_va_start(ap, 0)
++#define va_end(ap)        __builtin_va_end(ap)
++#define va_arg(ap, type)  __builtin_va_arg(ap, type)
++#define va_copy(dst, src) __builtin_va_copy(dst, src)
++
++#endif /* ZEPHYR_COSMOCC_STDARG_H_ */
+diff --git a/cmake/toolchain/cosmocc/include/stddef.h b/cmake/toolchain/cosmocc/include/stddef.h
+new file mode 100644
+index 00000000000..6edca8b4478
+--- /dev/null
++++ b/cmake/toolchain/cosmocc/include/stddef.h
+@@ -0,0 +1,34 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Freestanding <stddef.h> for cosmocc, which has no compiler-provided one.
++ */
++#ifndef ZEPHYR_COSMOCC_STDDEF_H_
++#define ZEPHYR_COSMOCC_STDDEF_H_
++
++typedef __SIZE_TYPE__ size_t;
++typedef __PTRDIFF_TYPE__ ptrdiff_t;
++#ifndef __cplusplus
++typedef __WCHAR_TYPE__ wchar_t;
++#endif
++typedef struct {
++	long long max_align_ll __attribute__((__aligned__(__alignof__(long long))));
++	long double max_align_ld __attribute__((__aligned__(__alignof__(long double))));
++} max_align_t;
++
++#undef NULL
++#ifdef __cplusplus
++#define NULL __null
++#else
++#define NULL ((void *)0)
++#endif
++#define offsetof(type, member) __builtin_offsetof(type, member)
++
++#endif /* ZEPHYR_COSMOCC_STDDEF_H_ */
++
++/* As GCC's: C libraries may ask for wint_t, defined only on request. */
++#if defined(__need_wint_t) && !defined(ZEPHYR_COSMOCC_WINT_T_)
++#define ZEPHYR_COSMOCC_WINT_T_
++typedef __WINT_TYPE__ wint_t;
++#endif
++#undef __need_wint_t
+diff --git a/cmake/toolchain/cosmocc/target.cmake b/cmake/toolchain/cosmocc/target.cmake
+new file mode 100644
+index 00000000000..d73c9c44819
+--- /dev/null
++++ b/cmake/toolchain/cosmocc/target.cmake
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: Apache-2.0
++
++# Cosmopolitan's ABI, as cosmocc applies it to all code.
++if(NATIVE_TARGET_HOST STREQUAL "x86_64")
++  if(NOT COSMOCC_LINUX_ONLY)
++    # No red zone: Windows writes below the stack pointer. TLS the runtime can relocate.
++    list(APPEND TOOLCHAIN_C_FLAGS -mno-red-zone -mno-tls-direct-seg-refs)
++  endif()
++else()
++  # x18 is reserved by macOS, and x28 holds Cosmopolitan's TLS pointer.
++  list(APPEND TOOLCHAIN_C_FLAGS -ffixed-x18 -ffixed-x28 -fsigned-char)
++endif()
++
++if(NOT CONFIG_64BIT)
++  message(FATAL_ERROR "cosmocc builds 64-bit programs only: use native_sim/native/64")
++endif()
+diff --git a/scripts/native_simulator/Makefile b/scripts/native_simulator/Makefile
+index 905fe88be98..09838475c26 100644
+--- a/scripts/native_simulator/Makefile
++++ b/scripts/native_simulator/Makefile
+@@ -141,7 +141,7 @@ ${NSI_EXE}: ${NSI_BUILD_PATH}/${RUNNER_LIB} ${LOCALIZED_EMBSW} ${NSI_EXTRA_LIBS}
+  ${NSI_BUILD_PATH}/linker_script.ld
+ 	${NSI_LINKER} -Wl,--whole-archive ${LOCALIZED_EMBSW} ${NSI_BUILD_PATH}/${RUNNER_LIB} \
+ 	  ${NSI_EXTRA_LIBS} -Wl,--no-whole-archive \
+-	  -o $@ ${FINALLINK_FLAGS} -T ${NSI_BUILD_PATH}/linker_script.ld
++	  -o $@ ${FINALLINK_FLAGS} -Wl,-T,${NSI_BUILD_PATH}/linker_script.ld
+ 
+ Makefile: ;
+ 
+diff --git a/scripts/native_simulator/common/src/nsi_errno.c b/scripts/native_simulator/common/src/nsi_errno.c
+index 946246ab5b1..1082de9d681 100644
+--- a/scripts/native_simulator/common/src/nsi_errno.c
++++ b/scripts/native_simulator/common/src/nsi_errno.c
+@@ -17,7 +17,8 @@ struct nsi_errno_mid_map {
+ 
+ #define ERR(_name) {_name, NSI_ERRNO_MID_##_name}
+ 
+-static const struct nsi_errno_mid_map map[] = {
++/* Not const: some C libraries (Cosmopolitan) define errno values as variables */
++static struct nsi_errno_mid_map map[] = {
+ 	{0, 0},
+ 	ERR(EPERM),
+ 	ERR(ENOENT),
+diff --git a/scripts/pylib/twister/twisterlib/testinstance.py b/scripts/pylib/twister/twisterlib/testinstance.py
+index cfd9a7166f7..cd7131569d9 100644
+--- a/scripts/pylib/twister/twisterlib/testinstance.py
++++ b/scripts/pylib/twister/twisterlib/testinstance.py
+@@ -261,8 +261,8 @@ class TestInstance(StatusMixin):
+         simulation = options.sim_name
+ 
+         simulator = self.platform.simulator_by_name(simulation)
+-        if os.name == 'nt' and simulator and simulator.name not in ('na', 'qemu'):
+-            # running on simulators is currently supported only for QEMU on Windows
++        if os.name == 'nt' and simulator and simulator.name not in ('na', 'qemu', 'native'):
++            # running on simulators is currently supported only for QEMU and native on Windows
+             return False
+ 
+         # QEMU_BIN_PATH is optional and acts as an override.
+diff --git a/scripts/pylib/twister/twisterlib/testplan.py b/scripts/pylib/twister/twisterlib/testplan.py
+index 13ccc140fbb..79b5e518ab2 100755
+--- a/scripts/pylib/twister/twisterlib/testplan.py
++++ b/scripts/pylib/twister/twisterlib/testplan.py
+@@ -875,7 +875,8 @@ class TestPlan:
+         if plat.build_toolchains:
+             return plat.build_toolchains
+         if plat.arch in ['posix', 'unit']:
+-            return ['host/llvm'] if self.env.toolchain in ['host/llvm'] else ['host/gnu']
++            return [self.env.toolchain] if self.env.toolchain in ['host/llvm', 'cosmocc'] \
++                else ['host/gnu']
+         if plat.preferred_toolchain:
+             return [plat.preferred_toolchain]
+         return [self.env.toolchain if self.env.toolchain else "zephyr"]
+@@ -1140,7 +1141,8 @@ class TestPlan:
+                         "Environment ({}) not satisfied".format(", ".join(plat.env)),
+                         Filters.ENVIRONMENT
+                     )
+-                if plat.type == 'native' and sys.platform != 'linux':
++                # cosmocc's native executables also run on macOS and Windows
++                if plat.type == 'native' and sys.platform != 'linux' and toolchain != 'cosmocc':
+                     instance.add_filter("Native platform requires Linux", Filters.ENVIRONMENT)
+ 
+                 if not force_toolchain \
+-- 
+2.56.0
+
