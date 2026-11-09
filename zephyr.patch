@@ -1,4 +1,4 @@
-From cfecebfddcceeeddfedb930f4baca76a98323e3e Mon Sep 17 00:00:00 2001
+From adaaeacdeddeecfdcadf2004b362770de3437b1c Mon Sep 17 00:00:00 2001
 From: Raul Hernandez <me@spaceface.dev>
 Date: Mon, 9 Nov 2026 17:47:17 +0100
 Subject: [PATCH] native_sim: add the cosmocc toolchain
@@ -56,12 +56,12 @@ Elsewhere:
  cmake/toolchain/cosmocc/include/stdarg.h      |  16 ++
  cmake/toolchain/cosmocc/include/stddef.h      |  34 +++++
  cmake/toolchain/cosmocc/target.cmake          |  16 ++
- scripts/native_simulator/Makefile             |   2 +-
+ scripts/native_simulator/Makefile             |  40 ++---
  .../native_simulator/common/src/nsi_errno.c   |   3 +-
  .../native_simulator/native/src/timer_model.c |   8 +-
  .../pylib/twister/twisterlib/testinstance.py  |   4 +-
  scripts/pylib/twister/twisterlib/testplan.py  |   6 +-
- 16 files changed, 262 insertions(+), 16 deletions(-)
+ 16 files changed, 281 insertions(+), 35 deletions(-)
  create mode 100644 cmake/toolchain/cosmocc/Kconfig.defconfig
  create mode 100644 cmake/toolchain/cosmocc/generic.cmake
  create mode 100644 cmake/toolchain/cosmocc/include/stdarg.h
@@ -440,10 +440,70 @@ index 00000000000..d73c9c44819
 +  message(FATAL_ERROR "cosmocc builds 64-bit programs only: use native_sim/native/64")
 +endif()
 diff --git a/scripts/native_simulator/Makefile b/scripts/native_simulator/Makefile
-index 905fe88be98..09838475c26 100644
+index 905fe88be98..6e01a0bbd09 100644
 --- a/scripts/native_simulator/Makefile
 +++ b/scripts/native_simulator/Makefile
-@@ -141,7 +141,7 @@ ${NSI_EXE}: ${NSI_BUILD_PATH}/${RUNNER_LIB} ${LOCALIZED_EMBSW} ${NSI_EXTRA_LIBS}
+@@ -95,27 +95,29 @@ ifdef NSI_NATIVE
+   INCLUDES+=-I${NSI_PATH}native/src/include/
+ endif
+ 
+-EXTRA_OBJS:=$(abspath $(addprefix $(NSI_BUILD_PATH)/,$(sort $(patsubst %.c,%.o,${NSI_EXTRA_SRCS:%.cpp=%.c}))))
++# Files given with absolute paths are mirrored under NSI_BUILD_PATH, without colons: a
++# Windows drive letter's colon inside a target would be taken for a rule separator.
++nsi_mirror = $(abspath $(NSI_BUILD_PATH)/$(subst :,,$(1)))
++
++EXTRA_OBJS:=$(sort $(foreach src,${NSI_EXTRA_SRCS},$(call nsi_mirror,$(basename $(src)).o)))
+ OBJS:=$(abspath $(addprefix $(NSI_BUILD_PATH)/,${SRCS:${NSI_PATH}%.c=%.o})) ${EXTRA_OBJS}
+ 
+ DEPENDFILES:=$(addsuffix .d,$(basename ${OBJS}))
+ 
+ -include ${DEPENDFILES}
+ 
+-LOCALIZED_EMBSW:=$(abspath $(addprefix $(NSI_BUILD_PATH)/,$(addsuffix .loc_cpusw.o,${NSI_EMBEDDED_CPU_SW})))
++LOCALIZED_EMBSW:=$(foreach sw,${NSI_EMBEDDED_CPU_SW},$(call nsi_mirror,$(sw).loc_cpusw.o))
+ 
+ ${NSI_BUILD_PATH}:
+ 	@if [ ! -d ${NSI_BUILD_PATH} ]; then mkdir -p ${NSI_BUILD_PATH}; fi
+ 
+-#Extra sources build:
+-${NSI_BUILD_PATH}/%.o: /%.c ${NSI_PATH}Makefile ${NSI_CONFIG_FILE}
+-	@if [ ! -d $(dir $@) ]; then mkdir -p $(dir $@); fi
+-	${NSI_CC} ${NSI_CPPFLAGS} ${INCLUDES} ${CFLAGS} -c $< -o $@
+-
+-#Extra C++ sources build:
+-${NSI_BUILD_PATH}/%.o: /%.cpp ${NSI_PATH}Makefile ${NSI_CONFIG_FILE}
+-	@if [ ! -d $(dir $@) ]; then mkdir -p $(dir $@); fi
+-	${NSI_CXX} ${NSI_CPPFLAGS} ${INCLUDES} ${CXXFLAGS} -c $< -o $@
++#Extra C and C++ sources build:
++define nsi_extra_src_rule
++$(call nsi_mirror,$(basename $(1)).o): $(1) ${NSI_PATH}Makefile ${NSI_CONFIG_FILE}
++	@if [ ! -d $$(dir $$@) ]; then mkdir -p $$(dir $$@); fi
++	$(if $(filter %.cpp,$(1)),$${NSI_CXX} $${NSI_CPPFLAGS} $${INCLUDES} $${CXXFLAGS},$${NSI_CC} $${NSI_CPPFLAGS} $${INCLUDES} $${CFLAGS}) -c $$< -o $$@
++endef
++$(foreach src,${NSI_EXTRA_SRCS},$(eval $(call nsi_extra_src_rule,$(src))))
+ 
+ ${NSI_BUILD_PATH}/%.o: ${NSI_PATH}/%.c ${NSI_PATH}Makefile ${NSI_CONFIG_FILE}
+ 	@if [ ! -d $(dir $@) ]; then mkdir -p $(dir $@); fi
+@@ -128,20 +130,18 @@ ${NSI_BUILD_PATH}/${RUNNER_LIB}: ${OBJS}
+ 	if [ -f $@ ]; then rm $@ ; fi
+ 	${NSI_AR} -cr $@ ${OBJS}
+ 
+-${NSI_BUILD_PATH}/%.loc_cpusw.o: /% ${NSI_CONFIG_FILE}
+-	@if [ -z $< ] || [ ! -f $< ]; then \
+-	  echo "Error: Input embedded CPU SW ($<) not found \
+-(NSI_EMBEDDED_CPU_SW=${NSI_EMBEDDED_CPU_SW} )"; \
+-	  false; \
+-	fi
+-	@if [ ! -d $(dir $@) ]; then mkdir -p $(dir $@); fi
+-	${NSI_OBJCOPY} --localize-hidden $< $@ -w --localize-symbol=_* ${NSI_LOCALIZE_OPTIONS}
++define nsi_localize_rule
++$(call nsi_mirror,$(1).loc_cpusw.o): $(1) ${NSI_CONFIG_FILE}
++	@if [ ! -d $$(dir $$@) ]; then mkdir -p $$(dir $$@); fi
++	$${NSI_OBJCOPY} --localize-hidden $$< $$@ -w --localize-symbol=_* $${NSI_LOCALIZE_OPTIONS}
++endef
++$(foreach sw,${NSI_EMBEDDED_CPU_SW},$(eval $(call nsi_localize_rule,$(sw))))
+ 
+ ${NSI_EXE}: ${NSI_BUILD_PATH}/${RUNNER_LIB} ${LOCALIZED_EMBSW} ${NSI_EXTRA_LIBS} \
   ${NSI_BUILD_PATH}/linker_script.ld
  	${NSI_LINKER} -Wl,--whole-archive ${LOCALIZED_EMBSW} ${NSI_BUILD_PATH}/${RUNNER_LIB} \
  	  ${NSI_EXTRA_LIBS} -Wl,--no-whole-archive \
