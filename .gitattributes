@@ -1,0 +1,3 @@
+# Scripts and byte-exact reference outputs must keep LF line endings on Windows too.
+* text=auto eol=lf
+*.com binary
