@@ -4,7 +4,7 @@ A case study for [Zephyr #120914](https://github.com/zephyrproject-rtos/zephyr/i
 
 Each device has its own Zephyr kernel, application state, clock, hardware models, and runner. The host and all 20 children link into one statically linked executable. No child images load at runtime.
 
-The executable is built with [Cosmopolitan Libc](https://github.com/jart/cosmopolitan)'s `cosmocc` (GCC 14 and GNU binutils), from upstream Zephyr v4.5.0 plus `zephyr.patch`. Linux, macOS and Windows build it, each for its own OS and CPU, in its own executable format. With `COSMOCC_PORTABLE=1`, the x86-64 build is instead one file for Linux, macOS and Windows, and the AArch64 build one for Linux and macOS. Cosmopolitan does not support Windows on ARM.
+The executable is built with [Cosmopolitan Libc](https://github.com/jart/cosmopolitan)'s `cosmocc` (GCC 14 and GNU binutils), from upstream Zephyr v4.5.0 plus `zephyr.patch`. Linux, macOS and Windows build it, each for its own OS and CPU. With `COSMOCC_PORTABLE=1`, the x86-64 build is instead one file for Linux, macOS and Windows, and the AArch64 build one for Linux and macOS. Cosmopolitan does not support Windows on ARM.
 
 ## Workload
 
@@ -41,8 +41,7 @@ The case study's executable is `build/<backend>/simulator.exe`. `.github/workflo
 - Executables are for the build host only, in its format:
   - **Linux:** ELF, from cosmocc's Linux-only (`-moptlinux`) libraries.
   - **Windows:** PE.
-  - **x86-64 macOS:** Mach-O, converted with cosmocc's `assimilate`.
-  - **Apple Silicon:** cosmocc cannot produce a native executable there. `zephyr.exe` is a script that starts `zephyr.exe.dbg` through Cosmopolitan's loader.
+  - **macOS:** cosmocc cannot make Mach-O executables that macOS accepts. `zephyr.exe` is a script that starts `zephyr.exe.dbg` through Cosmopolitan's loader.
   - **`COSMOCC_PORTABLE`:** Actually Portable Executables instead.
 - Outside Windows, CMake cannot start Cosmopolitan's tools directly: the variant adds shell launchers to the cosmocc tree.
 - Zephyr also accepts macOS and Windows build hosts when the target host is explicit, as with cosmocc.

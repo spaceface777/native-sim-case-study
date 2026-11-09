@@ -1,4 +1,4 @@
-From bfebbcdadbfebecbebadbf42ace0422f57c25240 Mon Sep 17 00:00:00 2001
+From abeaeefabcafececafcd89726db4e1972c9e8abb Mon Sep 17 00:00:00 2001
 From: Raul Hernandez <me@spaceface.dev>
 Date: Mon, 9 Nov 2026 17:47:17 +0100
 Subject: [PATCH] native_sim: add the cosmocc toolchain
@@ -16,12 +16,12 @@ cmake/toolchain/cosmocc:
   Picolibc would need more, so it is not supported.
 - Build the native simulator runner with cosmocc's driver, for
   Cosmopolitan Libc.
-- Executables are for the build host only, in its native format: ELF
-  linked with cosmocc's Linux-only libraries on Linux, PE on Windows,
-  Mach-O on x86-64 macOS. On Apple Silicon, which cosmocc cannot target
-  natively, zephyr.exe is a script that starts zephyr.exe.dbg through
-  Cosmopolitan's loader. COSMOCC_PORTABLE instead builds Actually
-  Portable Executables, for all of cosmocc's operating systems.
+- Executables are for the build host only: ELF linked with cosmocc's
+  Linux-only libraries on Linux, PE on Windows. cosmocc cannot make
+  Mach-O executables that macOS accepts: there, zephyr.exe is a script
+  that starts zephyr.exe.dbg through Cosmopolitan's loader.
+  COSMOCC_PORTABLE instead builds Actually Portable Executables, for all
+  of cosmocc's operating systems.
 - Outside Windows, CMake starts cosmocc's tools through shell launchers.
   These, and the headers, are added to the cosmocc tree once.
 
@@ -211,7 +211,7 @@ index 00000000000..0a5bb5bbb73
 +	default 16384
 diff --git a/cmake/toolchain/cosmocc/generic.cmake b/cmake/toolchain/cosmocc/generic.cmake
 new file mode 100644
-index 00000000000..e2871131316
+index 00000000000..5d35f61bb17
 --- /dev/null
 +++ b/cmake/toolchain/cosmocc/generic.cmake
 @@ -0,0 +1,120 @@
@@ -220,10 +220,10 @@ index 00000000000..e2871131316
 +# cosmocc: GCC and GNU binutils for Cosmopolitan Libc (https://github.com/jart/cosmopolitan).
 +# Set COSMOCC_TOOLCHAIN_PATH to an extracted cosmocc release.
 +#
-+# By default, native_sim executables are for this host only, in its executable format: ELF
-+# built with cosmocc's Linux-only libraries on Linux, Mach-O on x86-64 macOS, PE on Windows.
-+# Apple Silicon has no native format for them: zephyr.exe is a script that starts the ELF
-+# program, zephyr.exe.dbg, through Cosmopolitan's loader.
++# By default, native_sim executables are for this host only: ELF built with cosmocc's
++# Linux-only libraries on Linux, PE on Windows. On macOS, for which cosmocc cannot make
++# native executables, zephyr.exe is a script that starts the ELF program, zephyr.exe.dbg,
++# through Cosmopolitan's loader.
 +# With COSMOCC_PORTABLE, they are instead Actually Portable Executables: an x86-64 one runs
 +# on Linux, macOS and Windows, an AArch64 one on Linux and macOS (on macOS through the loader).
 +
@@ -302,27 +302,27 @@ index 00000000000..e2871131316
 +set(NATIVE_RUNNER_LINKER ${NATIVE_RUNNER_C_COMPILER})
 +
 +# On Linux, the driver's Linux-only executables are ELF, and on Windows its portable ones
-+# are PE. On macOS, convert them.
++# are PE. cosmocc cannot make Mach-O executables that macOS accepts: there, the executable
++# is a script that starts the ELF program (its .dbg file) through Cosmopolitan's loader.
 +if(CMAKE_HOST_APPLE AND NOT COSMOCC_PORTABLE)
-+  if(NATIVE_TARGET_HOST STREQUAL "aarch64")
-+    if(NOT EXISTS ${cosmocc_dir}/ape)
-+      string(RANDOM LENGTH 8 suffix)
++  if(NOT EXISTS ${cosmocc_dir}/ape)
++    string(RANDOM LENGTH 8 suffix)
++    if(NATIVE_TARGET_HOST STREQUAL "aarch64")
 +      execute_process(COMMAND cc -O2 -o ${cosmocc_dir}/ape.${suffix} ${cosmocc_bin}/ape-m1.c
 +                      COMMAND_ERROR_IS_FATAL ANY)
-+      file(RENAME ${cosmocc_dir}/ape.${suffix} ${cosmocc_dir}/ape)
++    else()
++      configure_file(${cosmocc_bin}/ape-x86_64.macho ${cosmocc_dir}/ape.${suffix} COPYONLY
++                     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
 +    endif()
-+    string(CONCAT convert
-+      "printf '#!/bin/sh\\nexec \"%s\" \"$0.dbg\" \"$@\"\\n' '${cosmocc_dir}/ape' >\"$out\"\n"
-+      "chmod +x \"$out\"\n")
-+  else()
-+    set(convert "exec '${cosmocc_bin}/assimilate' -c \"$out\"\n")
++    file(RENAME ${cosmocc_dir}/ape.${suffix} ${cosmocc_dir}/ape)
 +  endif()
 +  set(NATIVE_RUNNER_LINKER ${cosmocc_dir}/link)
 +  string(CONCAT script "#!/bin/sh\n"
-+    "'${cosmocc_driver}' ${cosmocc_driver_flags} \"$@\" || exit\n"
++    "'${cosmocc_driver}' \"$@\" || exit\n"
 +    "while [ $# -gt 1 ]; do [ \"$1\" != -o ] || out=$2; shift; done\n"
 +    "case $out in *.exe | *.com) ;; *) exit 0 ;; esac\n"
-+    "${convert}")
++    "printf '#!/bin/sh\\nexec \"%s\" \"$0.dbg\" \"$@\"\\n' '${cosmocc_dir}/ape' >\"$out\"\n"
++    "chmod +x \"$out\"\n")
 +  cosmocc_install(${NATIVE_RUNNER_LINKER} "${script}" EXECUTABLE)
 +endif()
 +

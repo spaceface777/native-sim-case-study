@@ -29,10 +29,13 @@ jobs:
           ref: v4.5.0
           path: zephyr
           fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12' # Zephyr's minimum
       - name: Install Zephyr's requirements
         run: |
           git -C zephyr apply ../zephyr.patch
-          $([[ $RUNNER_OS == Windows ]] && echo python || echo python3) -m venv venv
+          python -m venv venv
           . venv/*/activate
           pip install cmake ninja pyelftools pyyaml pykwalify packaging jsonschema \
             pytest tabulate natsort psutil colorama ply junitparser python-dotenv anytree
@@ -42,7 +45,18 @@ jobs:
           key: cosmocc-4.0.2
       - name: Build
         run: . venv/*/activate && ZEPHYR_BASE="$PWD/zephyr" ./run.sh build
+      - name: Windows diagnostics (temporary)
+        if: always() && runner.os == 'Windows'
+        run: |
+          set +e
+          printf '#include <stdio.h>\nint main(void) { puts("hello"); return 0; }\n' >h.c
+          build/cosmocc-4.0.2/bin/x86_64-unknown-cosmo-cc h.c -o h.exe; ./h.exe; echo "hello rc=$?"
+          cmd //c "build\\pthreads\\simulator.exe 1000000"; echo "cmd rc=$?"
+          powershell -Command '& .\build\pthreads\simulator.exe 1000000; "ps rc=$LASTEXITCODE"'
+          head -c 512 build/pthreads/simulator.exe | od -A d -c | head -8
+          ls -la build/pthreads/
       - name: Check and time
         run: ./run.sh check bench | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Zephyr samples and tests, with twister
+        if: always()
         run: . venv/*/activate && ZEPHYR_BASE="$PWD/zephyr" ./run.sh zephyr
