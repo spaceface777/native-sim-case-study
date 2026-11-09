@@ -1,4 +1,4 @@
-From abeaeefabcafececafcd89726db4e1972c9e8abb Mon Sep 17 00:00:00 2001
+From aceaccceeaeafcacebfb4cfaeaacbda5fe288f72 Mon Sep 17 00:00:00 2001
 From: Raul Hernandez <me@spaceface.dev>
 Date: Mon, 9 Nov 2026 17:47:17 +0100
 Subject: [PATCH] native_sim: add the cosmocc toolchain
@@ -47,20 +47,20 @@ Elsewhere:
 ---
  CMakeLists.txt                                |   2 +-
  arch/posix/CMakeLists.txt                     |   4 +-
- boards/native/common/natsim_config.cmake      |  15 ++-
+ boards/native/common/natsim_config.cmake      |  15 +-
  boards/native/common/natsim_linker_script.ld  |   5 +-
  boards/native/native_sim/twister.yaml         |   4 +
  cmake/modules/FindHostTools.cmake             |   5 +-
- cmake/toolchain/cosmocc/Kconfig.defconfig     |  15 +++
- cmake/toolchain/cosmocc/generic.cmake         | 120 ++++++++++++++++++
- cmake/toolchain/cosmocc/include/stdarg.h      |  16 +++
+ cmake/toolchain/cosmocc/Kconfig.defconfig     |  15 ++
+ cmake/toolchain/cosmocc/generic.cmake         | 137 ++++++++++++++++++
+ cmake/toolchain/cosmocc/include/stdarg.h      |  16 ++
  cmake/toolchain/cosmocc/include/stddef.h      |  34 +++++
- cmake/toolchain/cosmocc/target.cmake          |  16 +++
+ cmake/toolchain/cosmocc/target.cmake          |  16 ++
  scripts/native_simulator/Makefile             |   2 +-
  .../native_simulator/common/src/nsi_errno.c   |   3 +-
  .../pylib/twister/twisterlib/testinstance.py  |   4 +-
  scripts/pylib/twister/twisterlib/testplan.py  |   6 +-
- 15 files changed, 238 insertions(+), 13 deletions(-)
+ 15 files changed, 255 insertions(+), 13 deletions(-)
  create mode 100644 cmake/toolchain/cosmocc/Kconfig.defconfig
  create mode 100644 cmake/toolchain/cosmocc/generic.cmake
  create mode 100644 cmake/toolchain/cosmocc/include/stdarg.h
@@ -211,10 +211,10 @@ index 00000000000..0a5bb5bbb73
 +	default 16384
 diff --git a/cmake/toolchain/cosmocc/generic.cmake b/cmake/toolchain/cosmocc/generic.cmake
 new file mode 100644
-index 00000000000..5d35f61bb17
+index 00000000000..8fa11222b6e
 --- /dev/null
 +++ b/cmake/toolchain/cosmocc/generic.cmake
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,137 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +# cosmocc: GCC and GNU binutils for Cosmopolitan Libc (https://github.com/jart/cosmopolitan).
@@ -301,10 +301,10 @@ index 00000000000..5d35f61bb17
 +set(NATIVE_RUNNER_C_COMPILER "${cosmocc_driver} ${cosmocc_driver_flags}")
 +set(NATIVE_RUNNER_LINKER ${NATIVE_RUNNER_C_COMPILER})
 +
-+# On Linux, the driver's Linux-only executables are ELF, and on Windows its portable ones
-+# are PE. cosmocc cannot make Mach-O executables that macOS accepts: there, the executable
-+# is a script that starts the ELF program (its .dbg file) through Cosmopolitan's loader.
++# On Linux, the driver's Linux-only executables are ELF. Elsewhere, finish its executables:
 +if(CMAKE_HOST_APPLE AND NOT COSMOCC_PORTABLE)
++  # cosmocc cannot make Mach-O executables that macOS accepts. The executable is a script
++  # that starts the ELF program (its .dbg file) through Cosmopolitan's loader.
 +  if(NOT EXISTS ${cosmocc_dir}/ape)
 +    string(RANDOM LENGTH 8 suffix)
 +    if(NATIVE_TARGET_HOST STREQUAL "aarch64")
@@ -316,13 +316,30 @@ index 00000000000..5d35f61bb17
 +    endif()
 +    file(RENAME ${cosmocc_dir}/ape.${suffix} ${cosmocc_dir}/ape)
 +  endif()
-+  set(NATIVE_RUNNER_LINKER ${cosmocc_dir}/link)
-+  string(CONCAT script "#!/bin/sh\n"
-+    "'${cosmocc_driver}' \"$@\" || exit\n"
-+    "while [ $# -gt 1 ]; do [ \"$1\" != -o ] || out=$2; shift; done\n"
-+    "case $out in *.exe | *.com) ;; *) exit 0 ;; esac\n"
++  string(CONCAT finish
 +    "printf '#!/bin/sh\\nexec \"%s\" \"$0.dbg\" \"$@\"\\n' '${cosmocc_dir}/ape' >\"$out\"\n"
 +    "chmod +x \"$out\"\n")
++elseif(NATIVE_TARGET_HOST STREQUAL "x86_64" AND NOT COSMOCC_LINUX_ONLY)
++  # The driver's x86-64 portable executables are also PE files. Their PE header extends the
++  # data section up to .bss, but the file ends with the data's last section: other sections
++  # than .data, like Zephyr's, leave it short, and Windows refuses it. Pad it, then append
++  # the zip archive again, as the driver does.
++  string(CONCAT finish
++    "x='${cosmocc_bin}/x86_64-linux-cosmo-'\n"
++    "sym() { \"$x\"nm \"$out.dbg\" | awk -v s=\"$1\" '$3 == s {print $1}'; }\n"
++    "size=$((0x$(sym ape_ram_paddr) + 0x$(sym ape_ram_filesz) - 0x$(sym ape_cod_paddr)))\n"
++    "\"$x\"objcopy -S -O binary \"$out.dbg\" \"$out\" || exit\n"
++    "have=$(($(wc -c <\"$out\")))\n"
++    "[ $have -ge $size ] || head -c $((size - have)) /dev/zero >>\"$out\"\n"
++    "exec '${cosmocc_bin}/zipcopy' \"$out.dbg\" \"$out\"\n")
++endif()
++if(DEFINED finish)
++  set(NATIVE_RUNNER_LINKER ${cosmocc_dir}/link)
++  string(CONCAT script "#!/bin/sh\n"
++    "'${cosmocc_driver}' ${cosmocc_driver_flags} \"$@\" || exit\n"
++    "while [ $# -gt 1 ]; do [ \"$1\" != -o ] || out=$2; shift; done\n"
++    "case $out in *.exe | *.com) ;; *) exit 0 ;; esac\n"
++    "${finish}")
 +  cosmocc_install(${NATIVE_RUNNER_LINKER} "${script}" EXECUTABLE)
 +endif()
 +
