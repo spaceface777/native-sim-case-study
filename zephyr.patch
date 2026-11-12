@@ -1,4 +1,4 @@
-From edfeddcbccfcfbebcbab6163780632e959d2e427 Mon Sep 17 00:00:00 2001
+From cfeeecbcccdbeefffbbf7ac03fcd98cfb577d954 Mon Sep 17 00:00:00 2001
 From: Raul Hernandez <me@spaceface.dev>
 Date: Mon, 9 Nov 2026 17:47:17 +0100
 Subject: [PATCH] native_sim: add the cosmocc toolchain
@@ -12,7 +12,8 @@ cmake/toolchain/cosmocc:
   with Cosmopolitan's ABI flags.
 - Zephyr's code uses Zephyr's minimal C library, with a 16 KiB heap as
   native_sim has with its other C libraries. cosmocc 4.0.2 has no
-  freestanding stddef.h or stdarg.h: the variant provides them.
+  freestanding stddef.h or stdarg.h: they are added where GCC looks for
+  them.
   Picolibc would need more, so it is not supported.
 - Build the native simulator runner with cosmocc's driver, for
   Cosmopolitan Libc, without its preparation of every function for
@@ -29,9 +30,9 @@ cmake/toolchain/cosmocc:
   code.
 - Outside Windows, CMake starts cosmocc's tools through shell launchers.
   These, the compile and link scripts and the macOS loader are kept in
-  Zephyr's user cache, per cosmocc, which may be read-only. The scripts
-  are named per kind of executable, so that builds of different kinds
-  can share one cosmocc.
+  Zephyr's user cache, per cosmocc: a cosmocc with GCC's freestanding
+  headers may be read-only. The scripts are named per kind of
+  executable, so that builds of different kinds can share one cosmocc.
 
 Elsewhere:
 - FindHostTools: keep the cosmocc variant for native targets.
@@ -73,17 +74,17 @@ Elsewhere:
  cmake/linker/ld/linker_flags.cmake            |   7 +
  cmake/modules/FindHostTools.cmake             |   5 +-
  cmake/toolchain/cosmocc/Kconfig.defconfig     |  18 ++
- cmake/toolchain/cosmocc/generic.cmake         | 154 ++++++++++++++++++
+ cmake/toolchain/cosmocc/generic.cmake         | 171 ++++++++++++++++++
  cmake/toolchain/cosmocc/include/stdarg.h      |  16 ++
  cmake/toolchain/cosmocc/include/stddef.h      |  34 ++++
- cmake/toolchain/cosmocc/target.cmake          |  27 +++
- scripts/native_simulator/Makefile             |  40 ++---
+ cmake/toolchain/cosmocc/target.cmake          |  19 ++
+ scripts/native_simulator/Makefile             |  40 ++--
  .../common/src/include/nsi_cpu_if.h           |   8 +-
  .../native_simulator/common/src/nsi_errno.c   |   3 +-
  .../native_simulator/native/src/timer_model.c |   8 +-
  .../pylib/twister/twisterlib/testinstance.py  |   4 +-
  scripts/pylib/twister/twisterlib/testplan.py  |   6 +-
- 19 files changed, 331 insertions(+), 37 deletions(-)
+ 19 files changed, 340 insertions(+), 37 deletions(-)
  create mode 100644 cmake/toolchain/cosmocc/Kconfig.defconfig
  create mode 100644 cmake/toolchain/cosmocc/generic.cmake
  create mode 100644 cmake/toolchain/cosmocc/include/stdarg.h
@@ -278,10 +279,10 @@ index 00000000000..bb1de7a35ce
 +	default y
 diff --git a/cmake/toolchain/cosmocc/generic.cmake b/cmake/toolchain/cosmocc/generic.cmake
 new file mode 100644
-index 00000000000..c54190b0317
+index 00000000000..382d8dfddeb
 --- /dev/null
 +++ b/cmake/toolchain/cosmocc/generic.cmake
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,171 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +# cosmocc: GCC and GNU binutils for Cosmopolitan Libc (https://github.com/jart/cosmopolitan).
@@ -316,8 +317,8 @@ index 00000000000..c54190b0317
 +endif()
 +
 +# Zephyr's files for this cosmocc are the same for all builds on this host: they are kept in
-+# the user cache, as cosmocc may be read-only. Write each one only if it differs, atomically,
-+# as parallel builds may use them. In script mode (verify-toolchain), write none.
++# the user cache where possible. Write each one only if it differs, atomically, as parallel
++# builds may use them. In script mode (verify-toolchain), write none.
 +string(MD5 cosmocc_hash "${COSMOCC_TOOLCHAIN_PATH}")
 +set(cosmocc_dir ${USER_CACHE_DIR}/cosmocc/${cosmocc_hash})
 +function(cosmocc_install path content)
@@ -337,17 +338,34 @@ index 00000000000..c54190b0317
 +  file(RENAME ${path}.${suffix} ${path})
 +endfunction()
 +
++# cosmocc 4.0.2 lacks GCC's freestanding headers (its own include its C library's). GCC needs
++# an include directory of its own, and Zephyr's C library needs them: put them where GCC looks
++# for its own headers. Other cosmocc builds have them, and may then be read-only.
++file(GLOB cosmocc_gcc_versions ${COSMOCC_TOOLCHAIN_PATH}/libexec/gcc/${cosmocc_triple}/*)
++foreach(version_dir ${cosmocc_gcc_versions})
++  get_filename_component(version ${version_dir} NAME)
++  set(include ${COSMOCC_TOOLCHAIN_PATH}/lib/gcc/${cosmocc_triple}/${version}/include)
++  if(NOT EXISTS ${include}/stddef.h)
++    foreach(header stddef.h stdarg.h)
++      file(READ ${CMAKE_CURRENT_LIST_DIR}/include/${header} content)
++      cosmocc_install(${include}/${header} "${content}")
++    endforeach()
++  endif()
++endforeach()
++
 +# Cosmopolitan programs are Windows executables, once named so. Elsewhere, CMake cannot
 +# start them without an APE loader registered with the kernel, but any shell can.
 +set(cosmocc_tools gcc g++ ar nm objcopy objdump readelf strip ranlib ld.bfd)
-+set(CROSS_COMPILE ${cosmocc_dir}/${cosmocc_triple}-)
 +if(CMAKE_HOST_WIN32)
++  # Next to the originals: GCC finds its programs relative to its own.
++  set(CROSS_COMPILE ${cosmocc_bin}/${cosmocc_triple}-)
 +  foreach(tool ${cosmocc_tools})
 +    if(NOT CMAKE_SCRIPT_MODE_FILE)
-+      configure_file(${cosmocc_bin}/${cosmocc_triple}-${tool} ${CROSS_COMPILE}${tool}.exe COPYONLY)
++      configure_file(${CROSS_COMPILE}${tool} ${CROSS_COMPILE}${tool}.exe COPYONLY)
 +    endif()
 +  endforeach()
 +else()
++  set(CROSS_COMPILE ${cosmocc_dir}/${cosmocc_triple}-)
 +  foreach(tool ${cosmocc_tools})
 +    cosmocc_install(${CROSS_COMPILE}${tool}
 +      "#!/bin/sh\nexec '${cosmocc_bin}/${cosmocc_triple}-${tool}' \"$@\"\n" EXECUTABLE)
@@ -500,10 +518,10 @@ index 00000000000..6edca8b4478
 +#undef __need_wint_t
 diff --git a/cmake/toolchain/cosmocc/target.cmake b/cmake/toolchain/cosmocc/target.cmake
 new file mode 100644
-index 00000000000..0558280176c
+index 00000000000..4f476d8e86f
 --- /dev/null
 +++ b/cmake/toolchain/cosmocc/target.cmake
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,19 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +# Cosmopolitan's ABI, as cosmocc applies it to all code. The link needs it too: link time
@@ -519,14 +537,6 @@ index 00000000000..0558280176c
 +endif()
 +list(APPEND TOOLCHAIN_C_FLAGS ${cosmocc_abi_flags})
 +list(APPEND TOOLCHAIN_LD_FLAGS ${cosmocc_abi_flags})
-+
-+# Zephyr's C library needs GCC's freestanding headers, which cosmocc 4.0.2 lacks (its own
-+# include its C library's). Provide them then.
-+file(GLOB gcc_stddef
-+     ${COSMOCC_TOOLCHAIN_PATH}/lib/gcc/${NATIVE_TARGET_HOST}-linux-cosmo/*/include/stddef.h)
-+if(NOT gcc_stddef)
-+  list(APPEND TOOLCHAIN_C_FLAGS -isystem${CMAKE_CURRENT_LIST_DIR}/include)
-+endif()
 +
 +if(NOT CONFIG_64BIT)
 +  message(FATAL_ERROR "cosmocc builds 64-bit programs only: use native_sim/native/64")

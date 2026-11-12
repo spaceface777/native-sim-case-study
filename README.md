@@ -43,13 +43,13 @@ The case study's executable is `build/<backend>/simulator.exe`. `.github/workflo
   - The partial link of `zephyr.elf` outputs code (`-flinker-output=nolto-rel`), as the native simulator links it as an ordinary object. Upstream Zephyr disallows LTO for native libraries; a toolchain now declares that it supports it.
   - Only a native library's interface (`NATIVE_SIMULATOR_IF`) is visible outside it, so that link optimizes it as the whole program (`-fwhole-program`). The interface macros also mark their symbols `externally_visible`, which keeps them.
   - Cosmopolitan's ABI flags also go to the link: link time optimization generates code then, and does not keep options such as `-ffixed-x28`. Without them, AArch64 pthread backends crash.
-- Zephyr's own code uses Zephyr's minimal C library, with native_sim's usual 16 KiB heap. cosmocc 4.0.2 has no freestanding `stddef.h` or `stdarg.h`, so the variant provides them.
+- Zephyr's own code uses Zephyr's minimal C library, with native_sim's usual 16 KiB heap. cosmocc 4.0.2 has no freestanding `stddef.h` or `stdarg.h`, so the variant adds them where GCC looks for its own headers.
 - Executables are for the build host only, in its format:
   - **Linux:** ELF, from cosmocc's Linux-only (`-moptlinux`) libraries.
   - **Windows:** PE.
   - **macOS:** cosmocc cannot make Mach-O executables that macOS accepts. `zephyr.exe` is a script that starts `zephyr.exe.dbg` through Cosmopolitan's loader.
   - **`COSMOCC_PORTABLE`:** Actually Portable Executables instead.
-- Outside Windows, CMake cannot start Cosmopolitan's tools directly: the variant uses shell launchers. These, its compile and link scripts and the macOS loader are in Zephyr's user cache (`<cache>/cosmocc/<hash of the cosmocc path>`), so cosmocc may be read-only. The scripts are named per kind of executable (`<cpu>-linux`, `-host` or `-portable`), so builds of different kinds can share one cosmocc.
+- Outside Windows, CMake cannot start Cosmopolitan's tools directly: the variant uses shell launchers. These, its compile and link scripts and the macOS loader are in Zephyr's user cache (`<cache>/cosmocc/<hash of the cosmocc path>`). So on Linux and macOS, a cosmocc that has GCC's freestanding headers may be read-only. On Windows, the variant copies the tools to `.exe` files next to them. The scripts are named per kind of executable (`<cpu>-linux`, `-host` or `-portable`), so builds of different kinds can share one cosmocc.
 - Zephyr also accepts macOS and Windows build hosts when the target host is explicit, as with cosmocc.
 - For the usual single-image `zephyr.exe`:
   - The native simulator passes its `INSERT` linker scripts with `-Wl,-T`, so that they precede cosmocc's own script.
@@ -166,7 +166,7 @@ The 20 devices are copies of one image, one after the other. So each hot branch 
 - **64-bit only.** cosmocc builds 64-bit programs: use `native_sim/native/64`. Zephyr's code uses its minimal C library; picolibc would need more freestanding headers.
 - **Single-OS builds.** Only Linux has an OS-specific Cosmopolitan Libc (`-moptlinux`). On macOS and Windows, the executable has the host's format, but its library still contains the code for the other operating systems.
 - **Cosmopolitan 4.0.2 on x86-64.** `fenv_t` is 8 bytes, but `fegetenv()` writes 32. A resumed `swapcontext()` returns a stale `%rax` instead of 0. This code calls neither. The 2026-11-09 nightly has both bugs, still lacks Windows on ARM, and was no faster.
-- **That GCC 16 cosmocc.** It is root-owned in `/opt`, which the variant now supports. Its driver still reports GCC 14.1.0 for `--version` and `-dumpversion`. Its errno constants are not link-time symbols: objects compiled for 4.0.2 cannot link with it.
+- **That GCC 16 cosmocc.** It has GCC's freestanding headers, and is root-owned in `/opt`, which the variant now supports. Its driver still reports GCC 14.1.0 for `--version` and `-dumpversion`. Its errno constants are not link-time symbols: objects compiled for 4.0.2 cannot link with it.
 - **Rosetta.** Cosmopolitan x86-64 programs crash under Docker Desktop's Rosetta for Linux. Under macOS Rosetta, pthread backends never finish.
 
 ## Historical one-hour measurements — before Cosmopolitan
