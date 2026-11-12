@@ -156,6 +156,7 @@ The 20 devices are copies of one image, one after the other. So each hot branch 
 | Apple M1, `CONFIG_LTO`, PGO | **0.460** | **0.444** | 0.473 |
 
 - PGO makes coroutines 12% faster on the N100 (21% faster than 4.0.2), 10% on the M1. It also places hot code together, so the layout matters much less. pthreads backends gain about 1%.
+- Both the firmware and the runners have PGO there; `simulator.c` and Cosmopolitan Libc do not. On the M1, PGO of the firmware alone gains 8%, of the runners alone 5%, of both 13% (another run). PGO of `simulator.c` too, as `run.sh` builds it, gains less than 1% more.
 - The build takes about twice as long, plus the training: 3 minutes on the N100.
 - ccache must be off (`run.sh` turns it off). An instrumented object contains its profile's file name, which comes from the object's path. ccache does not hash that path: it gave one backend's runner the other's objects, which then wrote the other's profiles.
 - A Zephyr application's `zephyr.exe` can use PGO too: build with `-DEXTRA_CFLAGS=-fprofile-generate=<dir>`, and add `target_link_options(native_simulator INTERFACE -fprofile-generate=<dir>)` so that the runner's link has GCC's profiling runtime; run it; rebuild with `-fprofile-use=<dir>` instead. The synchronization sample worked so.
