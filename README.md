@@ -26,6 +26,7 @@ export ZEPHYR_BASE=/path/to/zephyr-v4.5.0
 ./run.sh zephyr           # Zephyr samples and test suites, built with cosmocc, run by twister
 COSMOCC_PORTABLE=1 ./run.sh build              # portable executables instead
 COSMOCC=/opt/cosmocc ./run.sh                    # another cosmocc, e.g. GCC 16 with LTO
+PGO=1 COSMOCC=/opt/cosmocc ./run.sh build        # also profile-guided (needs libgcov)
 RUNNER_CFLAGS=-DCORO_SAVE_CONTEXT ./run.sh build   # coroutines with per-thread errno, FP and C++ state
 ```
 
@@ -42,13 +43,13 @@ The case study's executable is `build/<backend>/simulator.exe`. `.github/workflo
   - The partial link of `zephyr.elf` outputs code (`-flinker-output=nolto-rel`), as the native simulator links it as an ordinary object. Upstream Zephyr disallows LTO for native libraries; a toolchain now declares that it supports it.
   - Only a native library's interface (`NATIVE_SIMULATOR_IF`) is visible outside it, so that link optimizes it as the whole program (`-fwhole-program`). The interface macros also mark their symbols `externally_visible`, which keeps them.
   - Cosmopolitan's ABI flags also go to the link: link time optimization generates code then, and does not keep options such as `-ffixed-x28`. Without them, AArch64 pthread backends crash.
-- Zephyr's own code uses Zephyr's minimal C library, with native_sim's usual 16 KiB heap. cosmocc has no freestanding `stddef.h` or `stdarg.h`, so the variant adds them where GCC looks for its own headers.
+- Zephyr's own code uses Zephyr's minimal C library, with native_sim's usual 16 KiB heap. cosmocc 4.0.2 has no freestanding `stddef.h` or `stdarg.h`, so the variant provides them.
 - Executables are for the build host only, in its format:
   - **Linux:** ELF, from cosmocc's Linux-only (`-moptlinux`) libraries.
   - **Windows:** PE.
   - **macOS:** cosmocc cannot make Mach-O executables that macOS accepts. `zephyr.exe` is a script that starts `zephyr.exe.dbg` through Cosmopolitan's loader.
   - **`COSMOCC_PORTABLE`:** Actually Portable Executables instead.
-- Outside Windows, CMake cannot start Cosmopolitan's tools directly: the variant adds shell launchers to the cosmocc tree. Its compile and link scripts are named per kind of executable (`<cpu>-linux`, `-host` or `-portable`), so builds of different kinds can share one cosmocc.
+- Outside Windows, CMake cannot start Cosmopolitan's tools directly: the variant uses shell launchers. These, its compile and link scripts and the macOS loader are in Zephyr's user cache (`<cache>/cosmocc/<hash of the cosmocc path>`), so cosmocc may be read-only. The scripts are named per kind of executable (`<cpu>-linux`, `-host` or `-portable`), so builds of different kinds can share one cosmocc.
 - Zephyr also accepts macOS and Windows build hosts when the target host is explicit, as with cosmocc.
 - For the usual single-image `zephyr.exe`:
   - The native simulator passes its `INSERT` linker scripts with `-Wl,-T`, so that they precede cosmocc's own script.
@@ -140,15 +141,31 @@ The 20 devices are copies of one image, one after the other. So each hot branch 
 - Clang 19 (what `-mclang` uses; the GCC 16 cosmocc has no Clang) is 1.4% slower than GCC 14, with the same libraries and build time. It cannot use LTO here: cosmocc has neither LLD nor LLVM's linker plugin. With 4.0.2, `nsi_errno.c` must be compiled by GCC: its errno values are variables, which only GCC's `-fportcosmo` turns into constants.
 - `-march=native` gains less than 1%, and the executable then needs the build machine's CPU. `-fipa-pta -flto-partition=one` gain nothing.
 - LTO of the runner too (`-flto` and a `gcc -r` link) gained 0.6% more on the M1. The case study does not do it.
-- Profile-guided optimization would need GCC's `libgcov`, which neither cosmocc has.
+- Profile-guided optimization (`PGO=1`, below) needs GCC's `libgcov`, which 4.0.2 lacks.
 - The other library modes, with LTO firmware, one layout each, gave: on the M1, `-msysv` as the default, `-mtiny` 2% slower; on the N100, `-mtinylinux`, `-msysv` and `COSMOCC_PORTABLE` as `-moptlinux`, `-mtiny` 2% faster. All within the layout effect above.
+
+### Profile-guided optimization
+
+`PGO=1 ./run.sh build` builds the firmware and runners instrumented (`-fprofile-generate`), runs the minute on both backends, and rebuilds with that profile (`-fprofile-use -fprofile-partial-training`), with `CONFIG_LTO`. With the GCC 16 cosmocc rebuilt with `libgcov`, over the same 16 layouts:
+
+| Coroutines, 10-minute world | Median s | Best s | Worst s |
+|---|---:|---:|---:|
+| Intel N100, `CONFIG_LTO` | 0.938 | 0.893 | 1.365 |
+| Intel N100, `CONFIG_LTO`, PGO | **0.821** | **0.770** | 0.936 |
+| Apple M1, `CONFIG_LTO` | 0.514 | 0.499 | 0.607 |
+| Apple M1, `CONFIG_LTO`, PGO | **0.460** | **0.444** | 0.473 |
+
+- PGO makes coroutines 12% faster on the N100 (21% faster than 4.0.2), 10% on the M1. It also places hot code together, so the layout matters much less. pthreads backends gain about 1%.
+- The build takes about twice as long, plus the training: 3 minutes on the N100.
+- ccache must be off (`run.sh` turns it off). An instrumented object contains its profile's file name, which comes from the object's path. ccache does not hash that path: it gave one backend's runner the other's objects, which then wrote the other's profiles.
+- A Zephyr application's `zephyr.exe` can use PGO too: build with `-DEXTRA_CFLAGS=-fprofile-generate=<dir>`, and add `target_link_options(native_simulator INTERFACE -fprofile-generate=<dir>)` so that the runner's link has GCC's profiling runtime; run it; rebuild with `-fprofile-use=<dir>` instead. The synchronization sample worked so.
 
 ## Notes
 
 - **64-bit only.** cosmocc builds 64-bit programs: use `native_sim/native/64`. Zephyr's code uses its minimal C library; picolibc would need more freestanding headers.
 - **Single-OS builds.** Only Linux has an OS-specific Cosmopolitan Libc (`-moptlinux`). On macOS and Windows, the executable has the host's format, but its library still contains the code for the other operating systems.
 - **Cosmopolitan 4.0.2 on x86-64.** `fenv_t` is 8 bytes, but `fegetenv()` writes 32. A resumed `swapcontext()` returns a stale `%rax` instead of 0. This code calls neither. The 2026-11-09 nightly has both bugs, still lacks Windows on ARM, and was no faster.
-- **That GCC 16 cosmocc.** Its driver still reports GCC 14.1.0 for `--version` and `-dumpversion`. Its errno constants are not link-time symbols: objects compiled for 4.0.2 cannot link with it.
+- **That GCC 16 cosmocc.** It is root-owned in `/opt`, which the variant now supports. Its driver still reports GCC 14.1.0 for `--version` and `-dumpversion`. Its errno constants are not link-time symbols: objects compiled for 4.0.2 cannot link with it.
 - **Rosetta.** Cosmopolitan x86-64 programs crash under Docker Desktop's Rosetta for Linux. Under macOS Rosetta, pthread backends never finish.
 
 ## Historical one-hour measurements — before Cosmopolitan

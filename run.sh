@@ -7,6 +7,7 @@
 # zephyr runs Zephyr's own samples and test suites below with twister, built with cosmocc.
 # COSMOCC_PORTABLE=1 builds portable executables. RUNNER_CFLAGS=-DCORO_SAVE_CONTEXT gives
 # each coroutine its own errno, floating-point environment and C++ exception state.
+# PGO=1 optimizes with a profile of the minute, if cosmocc has libgcov (4.0.2 does not).
 set -e -o pipefail
 cd "$(dirname "$0")"
 build=${BUILD:-$PWD/build} && mkdir -p "$build"
@@ -33,19 +34,37 @@ lto() { ! compgen -G "$cosmocc/libexec/gcc/*/*/lto1" >/dev/null || echo "$1"CONF
 zephyr_build() {
 	{
 		cmake -S "$1" -B "$2" -GNinja -DBOARD=native_sim/native/64 -DZEPHYR_MODULES= \
-			-DZEPHYR_TOOLCHAIN_VARIANT=cosmocc -DCOSMOCC_TOOLCHAIN_PATH="$cosmocc" $(lto -D)
+			-DZEPHYR_TOOLCHAIN_VARIANT=cosmocc -DCOSMOCC_TOOLCHAIN_PATH="$cosmocc" $(lto -D) "${@:3}"
 		cmake --build "$2"
 	} >"$2.log" 2>&1
 }
 
-if [[ $steps == *build* ]]; then
-	cosmocc_setup
-	# The firmware, compiled once.
-	zephyr_build app "$build/firmware" || { tail -n 30 "$build/firmware.log"; exit 1; }
+# The firmware, compiled once, then both backends' executables; all with these flags.
+build_world() {
+	zephyr_build app "$build/firmware" "-DEXTRA_CFLAGS=$1" ||
+		{ tail -n 30 "$build/firmware.log"; exit 1; }
 	instances=$(sed -n 's/^#define INSTANCES *//p' app/api.h)
 	for backend in $backends; do
-		scripts/assemble.sh "$build/firmware" "$instances" "$build/$backend" $backend
+		RUNNER_CFLAGS="${RUNNER_CFLAGS:-} $1" \
+			scripts/assemble.sh "$build/firmware" "$instances" "$build/$backend" $backend
 	done
+}
+
+if [[ $steps == *build* ]]; then
+	cosmocc_setup
+	if [[ -n ${PGO:-} ]]; then
+		# Build instrumented, run the minute on both backends, and rebuild with that profile.
+		# Not with ccache: identical objects of the two backends would write the same profile.
+		compgen -G "$cosmocc/*/lib/libgcov.a" >/dev/null ||
+			{ echo "PGO: $cosmocc has no libgcov" >&2; exit 1; }
+		export CCACHE_DISABLE=1
+		profile=$build/profile && rm -rf "$profile"
+		build_world "-fprofile-generate=$profile"
+		for backend in $backends; do "$build/$backend/simulator.exe" 60000000 >/dev/null; done
+		build_world "-fprofile-use=$profile -fprofile-partial-training -Wno-missing-profile"
+	else
+		build_world ""
+	fi
 fi
 
 if [[ $steps == *check* ]]; then

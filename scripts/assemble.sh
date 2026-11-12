@@ -4,7 +4,8 @@
 # into one executable:
 #   scripts/assemble.sh <Zephyr build dir> <instances> <output dir> pthreads|coroutines
 # The firmware's runner configuration (zephyr/NSI/nsi_config) provides everything else.
-# RUNNER_CFLAGS adds runner compiler flags, e.g. -DCORO_SAVE_CONTEXT (see runner/coro.c).
+# RUNNER_CFLAGS adds runner compiler flags, also for its final link, e.g. -DCORO_SAVE_CONTEXT
+# (see runner/coro.c).
 set -e -o pipefail
 zephyr=$1/zephyr instances=$2 out=$3 backend=$4
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -45,4 +46,4 @@ done
 # 5. Link the copies. Their instance tables form one array, in link order.
 images=()
 for ((i = 0; i < instances; i++)); do images+=("$out/image.o"); done
-"${link[@]}" -O3 -I"$root" "$root/simulator.c" "${images[@]}" -o "$out/simulator.exe"
+"${link[@]}" -O3 -I"$root" "$root/simulator.c" "${images[@]}" -o "$out/simulator.exe" ${RUNNER_CFLAGS:-}
