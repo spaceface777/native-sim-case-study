@@ -9,15 +9,15 @@
 # each coroutine its own errno, floating-point environment and C++ exception state.
 set -e -o pipefail
 cd "$(dirname "$0")"
-build=${BUILD:-$PWD/build}
+build=${BUILD:-$PWD/build} && mkdir -p "$build"
 steps=${*:-build check bench}
 backends='pthreads coroutines'
-cosmocc=$build/cosmocc-4.0.2 # GCC 14 and GNU binutils for Cosmopolitan Libc
+# GCC and GNU binutils for Cosmopolitan Libc: COSMOCC, or else the 4.0.2 release, downloaded.
+cosmocc=${COSMOCC:-$build/cosmocc-4.0.2}
 
 # Download and unpack cosmocc, once.
 cosmocc_setup() {
 	[[ ! -d $cosmocc ]] || return 0
-	mkdir -p "$build"
 	[[ -f $cosmocc.zip ]] || curl -fsSL -o "$cosmocc.zip" \
 		https://github.com/jart/cosmopolitan/releases/download/4.0.2/cosmocc-4.0.2.zip
 	{ sha256sum "$cosmocc.zip" 2>/dev/null || shasum -a 256 "$cosmocc.zip"; } |
@@ -26,11 +26,14 @@ cosmocc_setup() {
 	rm -rf "$cosmocc.part" && unzip -q "$cosmocc.zip" -d "$cosmocc.part" && mv "$cosmocc.part" "$cosmocc"
 }
 
+# Zephyr builds use link time optimization if this cosmocc has it (4.0.2 does not).
+lto() { ! compgen -G "$cosmocc/libexec/gcc/*/*/lto1" >/dev/null || echo "$1"CONFIG_LTO=y; }
+
 # Build a Zephyr application for native_sim with Zephyr's cosmocc toolchain, no west modules.
 zephyr_build() {
 	{
 		cmake -S "$1" -B "$2" -GNinja -DBOARD=native_sim/native/64 -DZEPHYR_MODULES= \
-			-DZEPHYR_TOOLCHAIN_VARIANT=cosmocc -DCOSMOCC_TOOLCHAIN_PATH="$cosmocc"
+			-DZEPHYR_TOOLCHAIN_VARIANT=cosmocc -DCOSMOCC_TOOLCHAIN_PATH="$cosmocc" $(lto -D)
 		cmake --build "$2"
 	} >"$2.log" 2>&1
 }
@@ -84,5 +87,5 @@ if [[ $steps == *zephyr* ]]; then
 	[[ $(uname -s) != MINGW* ]] || short=--short-build-path
 	ZEPHYR_TOOLCHAIN_VARIANT=cosmocc COSMOCC_TOOLCHAIN_PATH=$cosmocc \
 		python "$ZEPHYR_BASE/scripts/twister" -p native_sim/native/64 --outdir "$build/twister" \
-		--inline-logs ${short:-} $(printf -- "-T $ZEPHYR_BASE/%s " "${tests[@]}")
+		--inline-logs ${short:-} $(lto -x=) $(printf -- "-T $ZEPHYR_BASE/%s " "${tests[@]}")
 fi

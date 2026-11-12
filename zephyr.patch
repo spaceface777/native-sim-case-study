@@ -1,4 +1,4 @@
-From bcafeecaafaccfbcaaeb6bc171bc29006e6be8fa Mon Sep 17 00:00:00 2001
+From bbbffbfcbcabcebaeaecdc2745888c5ffa6aa294 Mon Sep 17 00:00:00 2001
 From: Raul Hernandez <me@spaceface.dev>
 Date: Mon, 9 Nov 2026 17:47:17 +0100
 Subject: [PATCH] native_sim: add the cosmocc toolchain
@@ -15,18 +15,31 @@ cmake/toolchain/cosmocc:
   stddef.h or stdarg.h: they are added where GCC looks for them.
   Picolibc would need more, so it is not supported.
 - Build the native simulator runner with cosmocc's driver, for
-  Cosmopolitan Libc.
+  Cosmopolitan Libc, without its preparation of every function for
+  Cosmopolitan's call tracer, which costs speed.
 - Executables are for the build host only: ELF linked with cosmocc's
   Linux-only libraries on Linux, PE on Windows. cosmocc cannot make
   Mach-O executables that macOS accepts: there, zephyr.exe is a script
   that starts zephyr.exe.dbg through Cosmopolitan's loader.
   COSMOCC_PORTABLE instead builds Actually Portable Executables, for all
-  of cosmocc's operating systems.
+  of cosmocc's operating systems. Windows refuses the driver's PE files
+  when sections other than .data end the data: they are padded.
+- With a cosmocc that has link time optimization, CONFIG_LTO works.
+  Cosmopolitan's ABI flags also go to the link, where LTO generates
+  code.
 - Outside Windows, CMake starts cosmocc's tools through shell launchers.
-  These, and the headers, are added to the cosmocc tree once.
+  These, and the headers, are added to the cosmocc tree once. The
+  compile and link scripts are named per kind of executable, so that
+  builds of different kinds can share a cosmocc tree.
 
 Elsewhere:
 - FindHostTools: keep the cosmocc variant for native targets.
+- LTO of native libraries: a toolchain can declare that it supports it
+  (TOOLCHAIN_SUPPORTS_NATIVE_LIBRARY_LTO). The partial link then
+  outputs code (-flinker-output=nolto-rel), and optimizes the library as
+  a whole program (-fwhole-program): only its NATIVE_SIMULATOR_IF
+  interface is visible outside it, and those macros now also mark it
+  externally_visible.
 - arch/posix: allow other build hosts when cross-compiling for an
   explicit NATIVE_TARGET_HOST.
 - natsim_config: let a toolchain choose the runner's compiler driver,
@@ -41,27 +54,35 @@ Elsewhere:
   writes to zephyr.exe.dbg.
 - nsi_errno.c: the errno table is not const, as Cosmopolitan's errno
   values are variables.
+- The native simulator's Makefile builds extra sources and localizes
+  embedded images given by absolute paths with rules of their own, as
+  Windows paths contain a drive letter's colon.
+- timer_model.c: fall back to CLOCK_MONOTONIC where CLOCK_MONOTONIC_RAW
+  is not available (Intel macOS under Cosmopolitan).
 - twister: build posix platforms with the cosmocc variant when selected,
   run native platforms on macOS and Windows with it, and list it for
   native_sim/native/64.
 ---
  CMakeLists.txt                                |   2 +-
+ Kconfig.zephyr                                |   8 +-
  arch/posix/CMakeLists.txt                     |   4 +-
  boards/native/common/natsim_config.cmake      |  15 +-
  boards/native/common/natsim_linker_script.ld  |   5 +-
  boards/native/native_sim/twister.yaml         |   4 +
+ cmake/linker/ld/linker_flags.cmake            |   7 +
  cmake/modules/FindHostTools.cmake             |   5 +-
- cmake/toolchain/cosmocc/Kconfig.defconfig     |  15 ++
- cmake/toolchain/cosmocc/generic.cmake         | 142 ++++++++++++++++++
+ cmake/toolchain/cosmocc/Kconfig.defconfig     |  18 ++
+ cmake/toolchain/cosmocc/generic.cmake         | 154 ++++++++++++++++++
  cmake/toolchain/cosmocc/include/stdarg.h      |  16 ++
- cmake/toolchain/cosmocc/include/stddef.h      |  34 +++++
- cmake/toolchain/cosmocc/target.cmake          |  16 ++
+ cmake/toolchain/cosmocc/include/stddef.h      |  34 ++++
+ cmake/toolchain/cosmocc/target.cmake          |  19 +++
  scripts/native_simulator/Makefile             |  40 ++---
+ .../common/src/include/nsi_cpu_if.h           |   8 +-
  .../native_simulator/common/src/nsi_errno.c   |   3 +-
  .../native_simulator/native/src/timer_model.c |   8 +-
  .../pylib/twister/twisterlib/testinstance.py  |   4 +-
  scripts/pylib/twister/twisterlib/testplan.py  |   6 +-
- 16 files changed, 284 insertions(+), 35 deletions(-)
+ 19 files changed, 323 insertions(+), 37 deletions(-)
  create mode 100644 cmake/toolchain/cosmocc/Kconfig.defconfig
  create mode 100644 cmake/toolchain/cosmocc/generic.cmake
  create mode 100644 cmake/toolchain/cosmocc/include/stdarg.h
@@ -81,6 +102,29 @@ index c759db57407..0e479adb832 100644
    )
    set(check_init_priorities_command
        ${PYTHON_EXECUTABLE} ${ZEPHYR_BASE}/scripts/build/check_init_priorities.py
+diff --git a/Kconfig.zephyr b/Kconfig.zephyr
+index 53de7adc8c5..322f6f5e9fa 100644
+--- a/Kconfig.zephyr
++++ b/Kconfig.zephyr
+@@ -503,11 +503,17 @@ endchoice
+ config LTO
+ 	bool "Link Time Optimization"
+ 	depends on !(GEN_ISR_TABLES || GEN_IRQ_VECTOR_TABLE) || ISR_TABLES_LOCAL_DECLARATION
+-	depends on !NATIVE_LIBRARY
++	depends on !NATIVE_LIBRARY || TOOLCHAIN_SUPPORTS_NATIVE_LIBRARY_LTO
+ 	depends on !CODE_DATA_RELOCATION
+ 	help
+ 	  This option enables Link Time Optimization.
+ 
++config TOOLCHAIN_SUPPORTS_NATIVE_LIBRARY_LTO
++	bool
++	help
++	  Hidden option to signal that the toolchain supports link time optimization of a
++	  native library, the prelinked Zephyr image that native_sim links with its runner.
++
+ config LTO_SINGLE_THREADED
+ 	bool "Single-threaded LTO"
+ 	depends on LTO
 diff --git a/arch/posix/CMakeLists.txt b/arch/posix/CMakeLists.txt
 index 2d2939b4381..e88dfe58c3c 100644
 --- a/arch/posix/CMakeLists.txt
@@ -170,6 +214,24 @@ index 752034123c1..244656b6566 100644
 +      - host
 +      - llvm
 +      - cosmocc
+diff --git a/cmake/linker/ld/linker_flags.cmake b/cmake/linker/ld/linker_flags.cmake
+index 537a00e8158..80c82a18970 100644
+--- a/cmake/linker/ld/linker_flags.cmake
++++ b/cmake/linker/ld/linker_flags.cmake
+@@ -44,6 +44,13 @@ else()
+ endif()
+ 
+ set_property(TARGET linker PROPERTY partial_linking "-r")
++if(CONFIG_LTO)
++  # Optimize while partially linking, into code: a native library is linked as such later.
++  # Only its interface (NATIVE_SIMULATOR_IF) is visible outside it: the rest is the whole
++  # program's own.
++  set_property(TARGET linker APPEND PROPERTY partial_linking
++               -flinker-output=nolto-rel -fwhole-program)
++endif()
+ 
+ set_property(TARGET linker PROPERTY lto_arguments -flto=auto -fno-ipa-sra -ffunction-sections -fdata-sections)
+ set_property(TARGET linker PROPERTY lto_arguments_st -flto=1 -fno-ipa-sra -ffunction-sections -fdata-sections)
 diff --git a/cmake/modules/FindHostTools.cmake b/cmake/modules/FindHostTools.cmake
 index 944ba887a4a..cc501356c67 100644
 --- a/cmake/modules/FindHostTools.cmake
@@ -191,10 +253,10 @@ index 944ba887a4a..cc501356c67 100644
    endif()
 diff --git a/cmake/toolchain/cosmocc/Kconfig.defconfig b/cmake/toolchain/cosmocc/Kconfig.defconfig
 new file mode 100644
-index 00000000000..0a5bb5bbb73
+index 00000000000..bb1de7a35ce
 --- /dev/null
 +++ b/cmake/toolchain/cosmocc/Kconfig.defconfig
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,18 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +# Zephyr's code is freestanding, and cosmocc provides only the few headers that Zephyr's
@@ -210,12 +272,15 @@ index 00000000000..0a5bb5bbb73
 +# The heap native_sim has with its other C libraries.
 +config COMMON_LIBC_MALLOC_ARENA_SIZE
 +	default 16384
++
++config TOOLCHAIN_SUPPORTS_NATIVE_LIBRARY_LTO
++	default y
 diff --git a/cmake/toolchain/cosmocc/generic.cmake b/cmake/toolchain/cosmocc/generic.cmake
 new file mode 100644
-index 00000000000..e8814e16467
+index 00000000000..83ff10e1247
 --- /dev/null
 +++ b/cmake/toolchain/cosmocc/generic.cmake
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,154 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +# cosmocc: GCC and GNU binutils for Cosmopolitan Libc (https://github.com/jart/cosmopolitan).
@@ -301,8 +366,20 @@ index 00000000000..e8814e16467
 +set(cosmocc_driver ${cosmocc_bin}/${NATIVE_TARGET_HOST}-unknown-cosmo-cc)
 +if(COSMOCC_LINUX_ONLY)
 +  set(cosmocc_driver_flags -moptlinux)
++  set(cosmocc_kind linux)
++else()
++  # Unlike -moptlinux, which needs no such flags, the driver otherwise prepares functions for
++  # Cosmopolitan's function call tracer (--ftrace), at some cost in speed. Undo that.
++  set(cosmocc_driver_flags "-fpatchable-function-entry=0 -finline-functions-called-once")
++  if(COSMOCC_PORTABLE)
++    set(cosmocc_kind portable)
++  else()
++    set(cosmocc_kind host)
++  endif()
 +endif()
-+set(NATIVE_RUNNER_C_COMPILER ${cosmocc_dir}/cc)
++# Its scripts differ between kinds of executables, which builds that share cosmocc may mix.
++set(cosmocc_scripts ${cosmocc_dir}/${NATIVE_TARGET_HOST}-${cosmocc_kind})
++set(NATIVE_RUNNER_C_COMPILER ${cosmocc_scripts}-cc)
 +cosmocc_install(${NATIVE_RUNNER_C_COMPILER}
 +  "#!/bin/sh\nexec '${cosmocc_driver}' ${cosmocc_driver_flags} \"$@\"\n" EXECUTABLE)
 +set(NATIVE_RUNNER_LINKER ${NATIVE_RUNNER_C_COMPILER})
@@ -340,7 +417,7 @@ index 00000000000..e8814e16467
 +    "exec '${cosmocc_bin}/zipcopy' \"$out.dbg\" \"$out\"\n")
 +endif()
 +if(DEFINED finish)
-+  set(NATIVE_RUNNER_LINKER ${cosmocc_dir}/link)
++  set(NATIVE_RUNNER_LINKER ${cosmocc_scripts}-link)
 +  string(CONCAT script "#!/bin/sh\n"
 +    "'${cosmocc_driver}' ${cosmocc_driver_flags} \"$@\" || exit\n"
 +    "while [ $# -gt 1 ]; do [ \"$1\" != -o ] || out=$2; shift; done\n"
@@ -422,22 +499,25 @@ index 00000000000..6edca8b4478
 +#undef __need_wint_t
 diff --git a/cmake/toolchain/cosmocc/target.cmake b/cmake/toolchain/cosmocc/target.cmake
 new file mode 100644
-index 00000000000..d73c9c44819
+index 00000000000..4f476d8e86f
 --- /dev/null
 +++ b/cmake/toolchain/cosmocc/target.cmake
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,19 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
-+# Cosmopolitan's ABI, as cosmocc applies it to all code.
++# Cosmopolitan's ABI, as cosmocc applies it to all code. The link needs it too: link time
++# optimization generates code then, and does not keep options such as -ffixed-x28.
 +if(NATIVE_TARGET_HOST STREQUAL "x86_64")
 +  if(NOT COSMOCC_LINUX_ONLY)
 +    # No red zone: Windows writes below the stack pointer. TLS the runtime can relocate.
-+    list(APPEND TOOLCHAIN_C_FLAGS -mno-red-zone -mno-tls-direct-seg-refs)
++    set(cosmocc_abi_flags -mno-red-zone -mno-tls-direct-seg-refs)
 +  endif()
 +else()
 +  # x18 is reserved by macOS, and x28 holds Cosmopolitan's TLS pointer.
-+  list(APPEND TOOLCHAIN_C_FLAGS -ffixed-x18 -ffixed-x28 -fsigned-char)
++  set(cosmocc_abi_flags -ffixed-x18 -ffixed-x28 -fsigned-char)
 +endif()
++list(APPEND TOOLCHAIN_C_FLAGS ${cosmocc_abi_flags})
++list(APPEND TOOLCHAIN_LD_FLAGS ${cosmocc_abi_flags})
 +
 +if(NOT CONFIG_64BIT)
 +  message(FATAL_ERROR "cosmocc builds 64-bit programs only: use native_sim/native/64")
@@ -515,6 +595,26 @@ index 905fe88be98..6e01a0bbd09 100644
  
  Makefile: ;
  
+diff --git a/scripts/native_simulator/common/src/include/nsi_cpu_if.h b/scripts/native_simulator/common/src/include/nsi_cpu_if.h
+index e8521fb9768..c2d390543c5 100644
+--- a/scripts/native_simulator/common/src/include/nsi_cpu_if.h
++++ b/scripts/native_simulator/common/src/include/nsi_cpu_if.h
+@@ -18,8 +18,14 @@ extern "C" {
+  * embedded SW library, both by the native simulator runner,
+  * and other possible embedded CPU's SW.
+  */
++#if defined(__GNUC__) && !defined(__clang__)
++/* Also visible to whole-program link time optimization (-fwhole-program) */
++#define NSI_EXTERNALLY_VISIBLE __attribute__((externally_visible))
++#else
++#define NSI_EXTERNALLY_VISIBLE
++#endif
+ #define NATIVE_SIMULATOR_IF_SECT(sect) __attribute__((visibility("default"))) \
+-	__attribute__((__section__(sect)))
++	NSI_EXTERNALLY_VISIBLE __attribute__((__section__(sect)))
+ #define NATIVE_SIMULATOR_IF NATIVE_SIMULATOR_IF_SECT(".native_sim_if")
+ #define NATIVE_SIMULATOR_IF_DATA NATIVE_SIMULATOR_IF_SECT(".native_sim_if.data")
+ #define NATIVE_SIMULATOR_IF_TEXT NATIVE_SIMULATOR_IF_SECT(".native_sim_if.text")
 diff --git a/scripts/native_simulator/common/src/nsi_errno.c b/scripts/native_simulator/common/src/nsi_errno.c
 index 946246ab5b1..1082de9d681 100644
 --- a/scripts/native_simulator/common/src/nsi_errno.c
@@ -589,5 +689,5 @@ index 13ccc140fbb..79b5e518ab2 100755
  
                  if not force_toolchain \
 -- 
-2.56.0
+2.56.1
 

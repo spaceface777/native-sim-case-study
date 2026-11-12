@@ -49,32 +49,8 @@ jobs:
           key: cosmocc-4.0.2
       - name: Build
         run: . venv/*/activate && ZEPHYR_BASE="$PWD/zephyr" ./run.sh build
-      - name: Windows diagnostics (temporary)
-        if: always() && runner.os == 'Windows'
-        timeout-minutes: 10
-        run: |
-          set +e
-          cat >sem.c <<'EOF'
-          #include <pthread.h>
-          #include <semaphore.h>
-          #include <stdio.h>
-          static sem_t a, b;
-          static void *other(void *arg) { for (int i = 0; i < 100000; i++) { sem_wait(&a); sem_post(&b); } return arg; }
-          int main(void) {
-          	pthread_t t; sem_init(&a, 0, 0); sem_init(&b, 0, 0); pthread_create(&t, 0, other, 0);
-          	for (int i = 0; i < 100000; i++) { sem_post(&a); sem_wait(&b); }
-          	pthread_join(t, 0); puts("semaphore ping-pong done"); return 0;
-          }
-          EOF
-          cc=build/cosmocc-4.0.2/bin/x86_64-unknown-cosmo-cc
-          $cc -O2 sem.c -o sem.exe && timeout 60 ./sem.exe; echo "sem rc=$?"
-          for b in coroutines pthreads; do
-            timeout 60 cmd //c "build\\$b\\simulator.exe 1000000" | tail -1; echo "cmd $b rc=${PIPESTATUS[0]}"
-            timeout 60 ./build/$b/simulator.exe 1000000 | tail -1; echo "bash $b rc=${PIPESTATUS[0]}"
-          done
-          ls -la build/pthreads/ build/coroutines/
       - name: Check and time
-        timeout-minutes: 30
+        timeout-minutes: 60 # Intel Mac runners take 30 minutes for the pthreads hour
         run: ./run.sh check bench | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Zephyr samples and tests, with twister
         if: always()
