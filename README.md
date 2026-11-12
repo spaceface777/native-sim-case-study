@@ -61,13 +61,13 @@ The case study's executable is `build/<backend>/simulator.exe`. `.github/workflo
 `CONFIG_BUILD_OUTPUT_EXE=n` leaves the firmware as `zephyr.elf`: a partially linked object, with Zephyr's iterable sections already bounded.
 
 **Assembly** (`scripts/assemble.sh`) reads the firmware's runner configuration, `zephyr/NSI/nsi_config`:
-1. Compile the upstream native simulator runner and `app/runner.c`. The coroutine backend replaces `nce.c` and `nct.c` with `runner/coro.c` and `runner/coro.S`.
+1. Compile the upstream native simulator runner and `app/runner.c`. The coroutine backend replaces `nce.c` and `nct.c` with `runner/coro.c`.
 2. Localize the firmware's hidden symbols, as the native simulator does.
 3. Link firmware and runner into one relocatable image with `ld -r`. The runner's linker script bounds the NSI registration sections inside the image.
 4. Localize every symbol, and fail if any global definition remains.
 5. Link the image 20 times with `simulator.c`. The linker collects the 20 `instances` tables into one array, and `simulator.c` checks that there are 20.
 
-**Coroutines** (`runner/coro.c`, `runner/coro.S`). The CPU and each Zephyr thread are stackful coroutines on the host thread. A switch saves the callee-saved registers. By default, all coroutines share the host thread's errno, floating-point environment and C++ exception state:
+**Coroutines** (`runner/coro.c`). The CPU and each Zephyr thread are stackful coroutines on the host thread. A switch is inline assembly in C: it stores the stack, frame and resume pointers, and jumps. It declares every other register clobbered, so the compiler saves only the registers whose values it needs, and only on the path that switches. Unlike a call to an assembly function, the optimizer sees through it: it is inlined, and register allocation, PGO and LTO work around it. Against the earlier `coro.S` functions, over 16 layouts of the 10-minute world: on the N100, 0.889 s instead of 0.940 with `CONFIG_LTO` and 0.784 instead of 0.818 with PGO too; on the M1, 0.475 instead of 0.499, and 0.425 instead of 0.445. The tables below were measured with `coro.S`. By default, all coroutines share the host thread's errno, floating-point environment and C++ exception state:
 - If firmware changes the rounding mode, exception masks or flush-to-zero, that change also affects every other thread and device.
 - Exception flags are shared.
 - Zephyr's own errno is per thread, so the shared host errno does not affect it.

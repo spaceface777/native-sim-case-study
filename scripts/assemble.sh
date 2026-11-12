@@ -21,7 +21,7 @@ rm -rf "$out" && mkdir -p "$out/runner"
 #    replaces the CPU and thread emulation (nce.c, nct.c), which use host threads.
 sources="$(ls "$nsi"common/src/*.c "$nsi"native/src/*.c) $(config NSI_EXTRA_SRCS)"
 [[ $backend == pthreads ]] ||
-	sources="$(echo "$sources" | grep -v '/nc[et]\.c$') $root/runner/coro.c $root/runner/coro.S"
+	sources="$(echo "$sources" | grep -v '/nc[et]\.c$') $root/runner/coro.c"
 for source in $sources; do
 	"${cc[@]}" -c "$source" -o "$out/runner/$(basename "$source").o" -std=c11 -DNSI_RUNNER_BUILD \
 		-DNSI_N_CPUS="$(config NSI_N_CPUS)" -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=600 \
