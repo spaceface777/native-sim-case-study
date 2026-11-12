@@ -50,9 +50,9 @@ jobs:
       - name: Build
         run: . venv/*/activate && ZEPHYR_BASE="$PWD/zephyr" ./run.sh build
       - name: Check and time
-        timeout-minutes: 60 # Intel Mac runners take 30 minutes for the pthreads hour
+        timeout-minutes: 90 # Intel Mac runners can take an hour
         run: ./run.sh check bench | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Zephyr samples and tests, with twister
         if: always()
-        timeout-minutes: 45
+        timeout-minutes: 90 # Intel Mac runners take over 45 minutes
         run: . venv/*/activate && ZEPHYR_BASE="$PWD/zephyr" ./run.sh zephyr
