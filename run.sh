@@ -8,17 +8,19 @@
 # COSMOCC_PORTABLE=1 builds portable executables. RUNNER_CFLAGS=-DCORO_SAVE_CONTEXT gives
 # each coroutine its own errno, floating-point environment and C++ exception state.
 # PGO=1 optimizes with a profile of the minute, if cosmocc has libgcov (4.0.2 does not).
+# TOOLCHAIN=host builds with Zephyr's host toolchain (the system's GCC and C library), Linux only.
 set -e -o pipefail
 cd "$(dirname "$0")"
 build=${BUILD:-$PWD/build} && mkdir -p "$build"
 steps=${*:-build check bench}
-backends='pthreads coroutines'
+backends='pthreads ucontext siglongjmp coroutines'
 # GCC and GNU binutils for Cosmopolitan Libc: COSMOCC, or else the 4.0.2 release, downloaded.
 cosmocc=${COSMOCC:-$build/cosmocc-4.0.2}
+toolchain=${TOOLCHAIN:-cosmocc}
 
 # Download and unpack cosmocc, once.
 cosmocc_setup() {
-	[[ ! -d $cosmocc ]] || return 0
+	[[ $toolchain == cosmocc && ! -d $cosmocc ]] || return 0
 	[[ -f $cosmocc.zip ]] || curl -fsSL -o "$cosmocc.zip" \
 		https://github.com/jart/cosmopolitan/releases/download/4.0.2/cosmocc-4.0.2.zip
 	{ sha256sum "$cosmocc.zip" 2>/dev/null || shasum -a 256 "$cosmocc.zip"; } |
@@ -32,14 +34,18 @@ lto() { ! compgen -G "$cosmocc/libexec/gcc/*/*/lto1" >/dev/null || echo "$1"CONF
 
 # Build a Zephyr application for native_sim with Zephyr's cosmocc toolchain, no west modules.
 zephyr_build() {
+	if [[ $toolchain == host ]]; then
+		set -- "$@" -DZEPHYR_TOOLCHAIN_VARIANT=host
+	else
+		set -- "$@" -DZEPHYR_TOOLCHAIN_VARIANT=cosmocc -DCOSMOCC_TOOLCHAIN_PATH="$cosmocc" $(lto -D)
+	fi
 	{
-		cmake -S "$1" -B "$2" -GNinja -DBOARD=native_sim/native/64 -DZEPHYR_MODULES= \
-			-DZEPHYR_TOOLCHAIN_VARIANT=cosmocc -DCOSMOCC_TOOLCHAIN_PATH="$cosmocc" $(lto -D) "${@:3}"
+		cmake -S "$1" -B "$2" -GNinja -DBOARD=native_sim/native/64 -DZEPHYR_MODULES= "${@:3}"
 		cmake --build "$2"
 	} >"$2.log" 2>&1
 }
 
-# The firmware, compiled once, then both backends' executables; all with these flags.
+# The firmware, compiled once, then each backend's executable; all with these flags.
 build_world() {
 	zephyr_build app "$build/firmware" "-DEXTRA_CFLAGS=$1" ||
 		{ tail -n 30 "$build/firmware.log"; exit 1; }
@@ -53,9 +59,9 @@ build_world() {
 if [[ $steps == *build* ]]; then
 	cosmocc_setup
 	if [[ -n ${PGO:-} ]]; then
-		# Build instrumented, run the minute on both backends, and rebuild with that profile.
-		# Not with ccache: identical objects of the two backends would write the same profile.
-		compgen -G "$cosmocc/*/lib/libgcov.a" >/dev/null ||
+		# Build instrumented, run the minute on every backend, and rebuild with that profile.
+		# Not with ccache: identical objects of different backends would write the same profile.
+		[[ $toolchain == host ]] || compgen -G "$cosmocc/*/lib/libgcov.a" >/dev/null ||
 			{ echo "PGO: $cosmocc has no libgcov" >&2; exit 1; }
 		export CCACHE_DISABLE=1
 		profile=$build/profile && rm -rf "$profile"

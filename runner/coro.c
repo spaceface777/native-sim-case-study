@@ -3,20 +3,30 @@
  * Coroutine CPU (NCE) and thread (NCT) emulation for the native simulator, replacing its
  * nce.c and nct.c. Those run the CPU and every Zephyr thread on their own host thread, and
  * hand control between them with semaphores. Here they are coroutines on the caller's host
- * thread, and a context switch is a jump, inline (coro_switch). By default they share the host
- * thread's errno, floating-point environment and C++ exception state. Define
- * CORO_SAVE_CONTEXT to give each coroutine its own, as each host thread has.
+ * thread. A context switch (coro_switch) is, by default, a jump, inline. For comparison,
+ * define instead:
+ *   CORO_UCONTEXT     swapcontext(), which also saves and restores the signal mask: a system
+ *                     call on each switch.
+ *   CORO_SIGLONGJMP   siglongjmp(), not saving the signal mask; makecontext() and setcontext()
+ *                     start each coroutine. (Note: POSIX does not define jumps to other stacks,
+ *                     but C libraries allow them, and e.g.QEMU's coroutines do the same.)
+ * By default they share the host thread's errno, floating-point environment and C++ exception
+ * state. Define CORO_SAVE_CONTEXT to give each coroutine its own, as each host thread has.
  *
  * Each instance links a private copy, and native_sim has one CPU: the state is static.
  */
 #define _GNU_SOURCE
+/* A fortified longjmp() (glibc's) refuses to jump to another stack. */
+#undef _FORTIFY_SOURCE
 #include <errno.h>
 #include <fenv.h>
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <ucontext.h>
 #include <unistd.h>
 #include "nce_if.h"
 #include "nct_if.h"
@@ -44,8 +54,16 @@ struct context {
 #endif
 
 struct coro {
+#if defined(CORO_UCONTEXT)
+	ucontext_t context;
+#elif defined(CORO_SIGLONGJMP)
+	sigjmp_buf env;
+	ucontext_t start; /* How a new coroutine starts, */
+	bool fresh;       /* until switched to once */
+#else
 	/* Where it resumes, while switched out: stack, code and frame pointers */
 	void *sp, *pc, *fp;
+#endif
 	char *stack;
 	void (*entry)(void *arg);
 	void *arg;
@@ -54,12 +72,31 @@ struct coro {
 #endif
 };
 
+/* Switch from one coroutine to another: from now resumes when switched to. */
+#if defined(CORO_UCONTEXT)
+static void coro_switch(struct coro *from, struct coro *to)
+{
+	/* Not checked: Cosmopolitan 4.0.2 returns a stale value on x86-64 when resumed. */
+	swapcontext(&from->context, &to->context);
+}
+#elif defined(CORO_SIGLONGJMP)
+static void coro_switch(struct coro *from, struct coro *to)
+{
+	if (sigsetjmp(from->env, 0) == 0) {
+		if (to->fresh) {
+			to->fresh = false;
+			setcontext(&to->start);
+		}
+		siglongjmp(to->env, 1);
+	}
+}
+#else
 /*
- * Switch from one coroutine to another: save where `from` resumes, at the end of this code,
- * and jump to where `to` resumes. It is inline, not a call, and declares every other register
- * clobbered: the compiler saves only those whose values it needs, around the switch only.
- * Registers that Cosmopolitan's ABI reserves (AArch64 x18, and x28, its TLS pointer) are the
- * same on every coroutine of this thread, and untouched.
+ * Save where `from` resumes, at the end of this code, and jump to where `to` resumes. It is
+ * inline, not a call, and declares every other register clobbered: the compiler saves only
+ * those whose values it needs, around the switch only. Registers that Cosmopolitan's ABI
+ * reserves (AArch64 x18, and x28, its TLS pointer) are the same on every coroutine of this
+ * thread, and untouched.
  */
 _Static_assert(offsetof(struct coro, sp) == 0 && offsetof(struct coro, pc) == 8 &&
 	       offsetof(struct coro, fp) == 16, "coro_switch expects sp, pc, fp first");
@@ -115,6 +152,7 @@ static inline __attribute__((always_inline)) void coro_switch(struct coro *from,
 #error "coro_switch: unsupported CPU"
 #endif
 }
+#endif
 
 static struct coro host, *current = &host;
 static struct coro *zombie; /* Aborted while running: freed once switched away from */
@@ -162,7 +200,7 @@ static void switch_to(struct coro *to)
 	resume();
 }
 
-/* Where a new coroutine starts, jumped to as if called (it never returns) */
+/* Where a new coroutine starts (it never returns) */
 static __attribute__((noreturn)) void start(void)
 {
 	resume();
@@ -182,12 +220,29 @@ static struct coro *coro_new(void (*entry)(void *arg), void *arg)
 	if (c->stack == MAP_FAILED || mprotect(c->stack, sysconf(_SC_PAGESIZE), PROT_NONE)) {
 		nsi_print_error_and_exit("%s: cannot allocate a stack\n", __func__);
 	}
+#if defined(CORO_UCONTEXT) || defined(CORO_SIGLONGJMP)
+#ifdef CORO_UCONTEXT
+	ucontext_t *context = &c->context;
+#else
+	ucontext_t *context = &c->start;
+	c->fresh = true;
+#endif
+	if (getcontext(context) != 0) {
+		nsi_print_error_and_exit("%s: getcontext failed\n", __func__);
+	}
+	context->uc_link = NULL;
+	context->uc_stack.ss_sp = c->stack;
+	context->uc_stack.ss_size = STACK_SIZE;
+	context->uc_stack.ss_flags = 0;
+	makecontext(context, start, 0);
+#else
 	c->sp = (void *)((uintptr_t)(c->stack + STACK_SIZE) & -16);
 #if defined(__x86_64__)
 	c->sp = (char *)c->sp - 8; /* The return address slot of a call */
 #endif
 	c->pc = (void *)start;
 	c->fp = NULL;
+#endif
 	c->entry = entry;
 	c->arg = arg;
 	save_context(c); /* Inherit the creator's, as a new thread does */

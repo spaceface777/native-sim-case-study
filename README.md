@@ -10,7 +10,7 @@ The executable is built with [Cosmopolitan Libc](https://github.com/jart/cosmopo
 
 Each device has three threads: a 100 ms heartbeat, deterministic multicast work every 10-100 ms, and an event/ACK receiver. The host delays messages by 1-10 ms. Devices run serially. Each grant ends after equal-time hardware events. The host omits idle grants and catches up each device's clock before input delivery.
 
-Each result contains 20 rows: acknowledged events and the last heartbeat that the world received. It also contains the complete traffic's FNV-1a hash and message count. The CPU and thread emulation run either on host threads (pthreads, upstream) or as coroutines on one host thread.
+Each result contains 20 rows: acknowledged events and the last heartbeat that the world received. It also contains the complete traffic's FNV-1a hash and message count. The CPU and thread emulation run either on host threads (`pthreads`, upstream's), or as coroutines on one host thread, which switch with `swapcontext()` (`ucontext`), with `siglongjmp()` (`siglongjmp`), or with inline assembly (`coroutines`).
 
 The minute result is `trace ff72adfdb93a52fe 143218`, checksum `1801075893`. The hour result is `trace 3f3db497f9b30aeb 8571855`, checksum `1796618671`. Both outputs are in `reference/`.
 
@@ -28,6 +28,7 @@ COSMOCC_PORTABLE=1 ./run.sh build              # portable executables instead
 COSMOCC=/opt/cosmocc ./run.sh                    # another cosmocc, e.g. GCC 16 with LTO
 PGO=1 COSMOCC=/opt/cosmocc ./run.sh build        # also profile-guided (needs libgcov)
 RUNNER_CFLAGS=-DCORO_SAVE_CONTEXT ./run.sh build   # coroutines with per-thread errno, FP and C++ state
+TOOLCHAIN=host ./run.sh build check bench      # Linux: the system's GCC and C library instead
 ```
 
 With the patch, a native_sim application builds the usual way, e.g. `cmake -S samples/hello_world -B build -GNinja -DBOARD=native_sim/native/64 -DZEPHYR_TOOLCHAIN_VARIANT=cosmocc -DCOSMOCC_TOOLCHAIN_PATH=<cosmocc> && cmake --build build`. The result is `build/zephyr/zephyr.exe`, with its symbols in `zephyr.exe.dbg`. Twister runs native_sim tests with `ZEPHYR_TOOLCHAIN_VARIANT=cosmocc`.
@@ -89,6 +90,20 @@ The case study's executable is `build/<backend>/simulator.exe`. `.github/workflo
 Twister filtered the rest, for example picolibc variants.
 
 ## Measurements
+
+### Backends, and Cosmopolitan against the system's GCC and C library
+
+The 10-minute world on each backend, median of five interleaved runs, one layout. The Intel N100 ran Ubuntu 26.04, pinned to one CPU: its GCC 15.2 and glibc 2.43 (`TOOLCHAIN=host`), against the GCC 16 cosmocc, with and without `CONFIG_LTO` (Zephyr only allows LTO of native_sim with cosmocc). The M1 ran the GCC 16 cosmocc with `CONFIG_LTO`. All outputs were identical.
+
+| Backend | N100, system GCC, glibc | N100, cosmocc | N100, cosmocc, `CONFIG_LTO` | M1, cosmocc, `CONFIG_LTO` |
+|---|---:|---:|---:|---:|
+| `pthreads` (upstream) | 16.64 s | 17.55 s | 17.02 s | 10.13 s |
+| `ucontext`: `swapcontext()` | 2.88 s (5.8x) | 2.57 s | 2.59 s | 1.73 s (5.9x) |
+| `siglongjmp`: `makecontext()` once, then `siglongjmp()` | 1.25 s (13.3x) | 1.23 s | 1.22 s | 0.545 s (18.6x) |
+| `coroutines`: inline assembly | 1.03 s (16.2x) | 1.04 s | 0.99 s | 0.471 s (21.5x) |
+
+- Each step removes work from a switch: host threads hand over through two semaphores and the kernel's scheduler; `swapcontext()` makes a system call for the signal mask; `siglongjmp()` saves and restores all callee-saved registers in library functions; the inline switch saves only what is live, without a call.
+- Cosmopolitan Libc costs upstream's pthreads 5% on the N100 (3% with LTO), and makes `swapcontext()` 11% faster. Otherwise the two are within the layout effect below.
 
 Previous: this repository's earlier `run.sh`, app and `simulator.c`, with Zephyr fork `a97d7e5a961` and host GCC or Clang at `-march=native`/`-mcpu=native`. Its coroutine column is the assembly primitive, which also saved the floating-point environment and errno on every switch. Cosmopolitan: these builds, at generic `-O3`. Each value is the median wall time of five 10-minute worlds, run interleaved. All 40 outputs per machine were identical.
 
