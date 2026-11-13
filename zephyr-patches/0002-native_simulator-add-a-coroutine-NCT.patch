@@ -1,0 +1,419 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Raul Hernandez <me@spaceface.dev>
+Date: Fri, 13 Nov 2026 17:55:30 +0100
+Subject: [PATCH] native_simulator: add a coroutine NCT
+
+nct.c gives each embedded thread a host thread and lets one of them run
+at a time. Each embedded context switch then wakes one host thread with
+a semaphore and blocks another, through the host's scheduler.
+
+Add nct_coro.c, which implements nct_if.h with stackful coroutines in
+the host thread of the embedded CPU. A context switch is a
+swapcontext(). errno and the C++ exception state, which are data of the
+host thread, are kept for each embedded thread.
+
+It does not depend on how NCE is implemented, and its state is per
+instance.
+
+Select it with NSI_NCT=coroutines, in Zephyr with
+CONFIG_NATIVE_SIMULATOR_NCT_COROUTINES. Host threads remain the
+default. The option's help lists what is lost: host tools see one host
+thread, and the embedded threads share its thread-local storage.
+---
+ boards/native/common/natsim_config.cmake      |   2 +
+ scripts/native_simulator/Makefile             |   7 +
+ .../native_simulator/common/coro/nct_coro.c   | 175 ++++++++++++++++++
+ .../native_simulator/common/coro/nsi_coro.c   |  87 +++++++++
+ .../native_simulator/common/coro/nsi_coro.h   |  38 ++++
+ soc/native/inf_clock/Kconfig                  |  19 ++
+ 6 files changed, 328 insertions(+)
+ create mode 100644 scripts/native_simulator/common/coro/nct_coro.c
+ create mode 100644 scripts/native_simulator/common/coro/nsi_coro.c
+ create mode 100644 scripts/native_simulator/common/coro/nsi_coro.h
+
+diff --git a/boards/native/common/natsim_config.cmake b/boards/native/common/natsim_config.cmake
+index a154376d292..82d0517251a 100644
+--- a/boards/native/common/natsim_config.cmake
++++ b/boards/native/common/natsim_config.cmake
+@@ -25,6 +25,8 @@ endif()
+ foreach(component NCE NCT)
+   if(CONFIG_NATIVE_SIMULATOR_${component}_CUSTOM)
+     set(nsi_${component} custom)
++  elseif(CONFIG_NATIVE_SIMULATOR_${component}_COROUTINES)
++    set(nsi_${component} coroutines)
+   else()
+     set(nsi_${component} pthreads)
+   endif()
+diff --git a/scripts/native_simulator/Makefile b/scripts/native_simulator/Makefile
+index 347d2e15419..871870d16e2 100644
+--- a/scripts/native_simulator/Makefile
++++ b/scripts/native_simulator/Makefile
+@@ -41,6 +41,7 @@ NSI_LINK_OPTIONS?=${NSI_ARCH} ${NSI_COVERAGE}
+ NSI_BUILD_C_OPTIONS?=
+ NSI_BUILD_CXX_OPTIONS?=
+ #  CPU start/stop (NCE) and thread (NCT) emulation: "pthreads" builds common/src/nce.c and nct.c.
++#  NSI_NCT=coroutines builds common/coro/nct_coro.c instead.
+ #  With any other value the runner is built without them, and NSI_EXTRA_SRCS must provide
+ #  the functions of nce_if.h or nct_if.h
+ NSI_NCE?=pthreads
+@@ -94,6 +95,12 @@ endif
+ ifeq (${NSI_NCT},pthreads)
+   SRCS+=${NSI_PATH}common/src/nct.c
+ endif
++ifeq (${NSI_NCT},coroutines)
++  SRCS+=${NSI_PATH}common/coro/nct_coro.c
++endif
++ifneq ($(filter coroutines,${NSI_NCE} ${NSI_NCT}),)
++  SRCS+=${NSI_PATH}common/coro/nsi_coro.c
++endif
+ ifdef NSI_NATIVE
+   SRCS+=$(shell ls ${NSI_PATH}native/src/*.c)
+ endif
+diff --git a/scripts/native_simulator/common/coro/nct_coro.c b/scripts/native_simulator/common/coro/nct_coro.c
+new file mode 100644
+index 00000000000..09865ff30a7
+--- /dev/null
++++ b/scripts/native_simulator/common/coro/nct_coro.c
+@@ -0,0 +1,175 @@
++/*
++ * Copyright (c) 2026 Raúl Hernández López
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/*
++ * Native simulator CPU threading emulation with coroutines, instead of nct.c's host threads.
++ *
++ * nct.c gives each embedded thread a host thread, and lets only one of them run: it wakes
++ * the next one with a semaphore, and blocks the previous one. So the host's scheduler takes
++ * part in every embedded context switch.
++ *
++ * Here each embedded thread is a coroutine on the host thread which runs the embedded CPU,
++ * and a context switch is a switch of stack and registers in that host thread.
++ * The embedded OS decides which thread runs, as before.
++ *
++ * What differs from nct.c:
++ *  - A debugger sees one host thread. It shows the embedded thread which is running, not the
++ *    others.
++ *  - All embedded threads share the host thread's thread-local storage. Only errno and the
++ *    C++ exception state are saved and restored on context switches.
++ *  - Tools which follow the stack of each host thread (sanitizers, Valgrind) need to be told
++ *    about each switch. This code does not tell them.
++ */
++
++#include <stdlib.h>
++#include "nct_if.h"
++#include "nsi_coro.h"
++#include "nsi_tracing.h"
++
++struct nct {
++	void (*entry)(void *payload);
++	struct nsi_coro **threads; /* By thread index. NULL once aborted */
++	int n_threads;
++	struct nsi_coro *running;
++	struct nsi_coro boot;      /* Whoever starts the first thread. Never resumed */
++	struct nsi_coro *zombie;   /* Aborted while running. Freed once another one runs */
++};
++
++static void *nct_alloc(void *old, size_t size)
++{
++	void *new = realloc(old, size);
++
++	if (new == NULL) {
++		nsi_print_error_and_exit("%s: Can't allocate memory\n", __func__);
++	}
++	return new;
++}
++
++static void nct_free(struct nsi_coro *thread)
++{
++	nsi_coro_free(thread);
++	free(thread);
++}
++
++static void nct_switch_to(struct nct *this, struct nsi_coro *to)
++{
++	struct nsi_coro *from = this->running;
++
++	this->running = to;
++	nsi_coro_switch(from, to);
++
++	/* Resumed, so this is not running on the stack of a thread which aborted itself */
++	if (this->zombie != NULL) {
++		nct_free(this->zombie);
++		this->zombie = NULL;
++	}
++}
++
++/*
++ * Initialize an instance of the threading emulator.
++ * <fptr> is what each new thread runs, with the payload of nct_new_thread().
++ */
++void *nct_init(void (*fptr)(void *))
++{
++	struct nct *this = nct_alloc(NULL, sizeof(*this));
++
++	*this = (struct nct){.entry = fptr};
++	this->running = &this->boot;
++	return this;
++}
++
++/*
++ * The host frees the stacks when the process exits. They cannot be freed here: this may
++ * be running on one of them, or the host thread of the CPU may be blocked on one.
++ */
++void nct_clean_up(void *this_arg)
++{
++	(void)this_arg;
++}
++
++/* Create a thread, which runs when it is first swapped to. Return its index. */
++int nct_new_thread(void *this_arg, void *payload)
++{
++	struct nct *this = this_arg;
++	struct nsi_coro *thread = nct_alloc(NULL, sizeof(*thread));
++
++	nsi_coro_create(thread, this->entry, payload);
++	this->threads = nct_alloc(this->threads, (this->n_threads + 1) * sizeof(*this->threads));
++	this->threads[this->n_threads] = thread;
++	return this->n_threads++;
++}
++
++/* Let the first embedded thread run. The caller's context is abandoned: this never returns. */
++void nct_first_thread_start(void *this_arg, int next_allowed_thread_nbr)
++{
++	struct nct *this = this_arg;
++
++	nct_switch_to(this, this->threads[next_allowed_thread_nbr]);
++}
++
++/*
++ * Let <next_allowed_thread_nbr> run instead of the calling thread, which resumes (this
++ * returns) when another thread swaps back to it.
++ */
++void nct_swap_threads(void *this_arg, int next_allowed_thread_nbr)
++{
++	struct nct *this = this_arg;
++	struct nsi_coro *next = this->threads[next_allowed_thread_nbr];
++
++	if (next != this->running) {
++		nct_switch_to(this, next);
++	}
++}
++
++/*
++ * Abort a thread. If it is the calling thread, it continues until it swaps to another, and
++ * never resumes.
++ */
++void nct_abort_thread(void *this_arg, int thread_idx)
++{
++	struct nct *this = this_arg;
++	struct nsi_coro *thread = this->threads[thread_idx];
++
++	if (thread == NULL) {
++		return;
++	}
++	this->threads[thread_idx] = NULL;
++
++	if (thread != this->running) {
++		nct_free(thread);
++		return;
++	}
++	if (this->zombie != NULL) { /* It started a thread which never swapped back */
++		nct_free(this->zombie);
++	}
++	this->zombie = thread;
++}
++
++int nct_get_unique_thread_id(void *this_arg, int thread_idx)
++{
++	(void)this_arg;
++
++	return thread_idx;
++}
++
++/* Coroutines have no name that a host tool could show */
++int nct_thread_name_set(void *this_arg, int thread_idx, const char *str)
++{
++	(void)this_arg;
++	(void)thread_idx;
++	(void)str;
++
++	return 0;
++}
++
++void nct_get_thread_stack(void *this_arg, int thread_idx, void **stack_addr,
++			  unsigned long *stack_size)
++{
++	struct nct *this = this_arg;
++
++	*stack_addr = this->threads[thread_idx]->stack;
++	*stack_size = NSI_CORO_STACK_SIZE;
++}
+diff --git a/scripts/native_simulator/common/coro/nsi_coro.c b/scripts/native_simulator/common/coro/nsi_coro.c
+new file mode 100644
+index 00000000000..4167982e87c
+--- /dev/null
++++ b/scripts/native_simulator/common/coro/nsi_coro.c
+@@ -0,0 +1,87 @@
++/*
++ * Copyright (c) 2026 Raúl Hernández López
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/*
++ * Stackful coroutines with the host C library's ucontext: it knows the host's ABI, and
++ * which registers and state a context switch must save.
++ */
++
++#define _GNU_SOURCE
++#include <errno.h>
++#include <stdint.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include "nsi_coro.h"
++#include "nsi_tracing.h"
++
++/*
++ * swapcontext() switches what the CPU holds. errno and the C++ runtime's exception state
++ * (if one is linked) are instead thread-local data of the host thread, which all its
++ * coroutines share: nsi_coro_switch() keeps each coroutine's own.
++ */
++struct cxa_eh_globals {
++	void *caught_exceptions;
++	unsigned int uncaught_exceptions;
++};
++struct cxa_eh_globals *__cxa_get_globals(void) __attribute__((weak));
++
++static void start(unsigned int high, unsigned int low)
++{
++	struct nsi_coro *coro = (struct nsi_coro *)(uintptr_t)(((uint64_t)high << 32) | low);
++
++	if (__cxa_get_globals != NULL) {
++		*__cxa_get_globals() = (struct cxa_eh_globals){0};
++	}
++	coro->entry(coro->arg);
++	nsi_print_error_and_exit("%s: The coroutine's entry function returned\n", __func__);
++}
++
++void nsi_coro_create(struct nsi_coro *coro, void (*entry)(void *arg), void *arg)
++{
++	uint64_t self = (uintptr_t)coro;
++
++	/* The lowest page is a guard: a stack overflow faults instead of corrupting memory */
++	coro->stack = mmap(NULL, NSI_CORO_STACK_SIZE, PROT_READ | PROT_WRITE,
++			   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++	if ((coro->stack == MAP_FAILED) ||
++	    (mprotect(coro->stack, sysconf(_SC_PAGESIZE), PROT_NONE) != 0) ||
++	    (getcontext(&coro->context) != 0)) {
++		nsi_print_error_and_exit("%s: Cannot create a coroutine\n", __func__);
++	}
++	coro->entry = entry;
++	coro->arg = arg;
++	coro->context.uc_link = NULL;
++	coro->context.uc_stack.ss_sp = coro->stack;
++	coro->context.uc_stack.ss_size = NSI_CORO_STACK_SIZE;
++	/* makecontext() passes int arguments only */
++	makecontext(&coro->context, (void (*)(void))start, 2, (unsigned int)(self >> 32),
++		    (unsigned int)self);
++}
++
++void nsi_coro_free(struct nsi_coro *coro)
++{
++	munmap(coro->stack, NSI_CORO_STACK_SIZE);
++}
++
++void nsi_coro_switch(struct nsi_coro *from, struct nsi_coro *to)
++{
++	/* These locals are on this coroutine's stack until it resumes */
++	int saved_errno = errno;
++	struct cxa_eh_globals saved_eh = {0};
++
++	if (__cxa_get_globals != NULL) {
++		saved_eh = *__cxa_get_globals();
++	}
++
++	if (swapcontext(&from->context, &to->context) != 0) {
++		nsi_print_error_and_exit("%s: swapcontext() failed\n", __func__);
++	}
++
++	if (__cxa_get_globals != NULL) {
++		*__cxa_get_globals() = saved_eh;
++	}
++	errno = saved_errno;
++}
+diff --git a/scripts/native_simulator/common/coro/nsi_coro.h b/scripts/native_simulator/common/coro/nsi_coro.h
+new file mode 100644
+index 00000000000..4cfdc230b13
+--- /dev/null
++++ b/scripts/native_simulator/common/coro/nsi_coro.h
+@@ -0,0 +1,38 @@
++/*
++ * Copyright (c) 2026 Raúl Hernández López
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/*
++ * Stackful coroutines: execution contexts with their own stack. One runs only when another
++ * switches to it, on that one's host thread, until it switches to another itself.
++ */
++#ifndef NSI_COMMON_CORO_NSI_CORO_H
++#define NSI_COMMON_CORO_NSI_CORO_H
++
++#include <ucontext.h>
++
++/* As a host thread's. It is only reserved: the host commits the pages that are used. */
++#define NSI_CORO_STACK_SIZE (8 * 1024 * 1024)
++
++struct nsi_coro {
++	ucontext_t context; /* Where it resumes, while it is switched out */
++	void *stack;
++	void (*entry)(void *arg);
++	void *arg;
++};
++
++/* Give <coro> a stack. The first switch to it calls <entry>, which must not return. */
++void nsi_coro_create(struct nsi_coro *coro, void (*entry)(void *arg), void *arg);
++
++/* Free the stack of a coroutine which is not running. */
++void nsi_coro_free(struct nsi_coro *coro);
++
++/*
++ * Suspend the running code, saving where it resumes in <from>, and resume <to>.
++ * <from> needs no nsi_coro_create(): it can be the host thread's own context.
++ */
++void nsi_coro_switch(struct nsi_coro *from, struct nsi_coro *to);
++
++#endif /* NSI_COMMON_CORO_NSI_CORO_H */
+diff --git a/soc/native/inf_clock/Kconfig b/soc/native/inf_clock/Kconfig
+index 86469a150a8..4cb216b4741 100644
+--- a/soc/native/inf_clock/Kconfig
++++ b/soc/native/inf_clock/Kconfig
+@@ -88,6 +88,25 @@ config NATIVE_SIMULATOR_NCT_PTHREADS
+ 	  Each embedded thread runs in its own host thread. They hand execution to each other
+ 	  with semaphores, so that only the one the embedded OS selected runs.
+ 
++config NATIVE_SIMULATOR_NCT_COROUTINES
++	bool "Coroutines"
++	depends on NATIVE_SIMULATOR_NUMBER_MCUS = 1
++	depends on !ASAN && !MSAN
++	help
++	  Each embedded thread is a coroutine in the host thread of the embedded CPU. A context
++	  switch changes stack and registers in that host thread, without the host's scheduler.
++	  Applications which switch context very often run several times faster.
++
++	  The embedded OS selects which thread runs, as with host threads. But:
++	  - A debugger shows one host thread, with the embedded thread which is running.
++	    It does not show the other embedded threads.
++	  - All embedded threads share the host thread's thread-local storage.
++	    Only errno and the C++ exception state are saved and restored on context switches.
++	  - Sanitizers and Valgrind do not know of the switches.
++	  - The host C library must have getcontext(), makecontext() and swapcontext().
++	    glibc has them, musl does not.
++	  - It is not tested with several MCUs.
++
+ config NATIVE_SIMULATOR_NCT_CUSTOM
+ 	bool "Provided by the application"
+ 	help

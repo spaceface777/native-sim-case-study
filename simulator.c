@@ -2,15 +2,14 @@
 #include "app/api.h"
 #include <inttypes.h>
 #include <stdio.h>
-#include <stdlib.h>
 
-extern const struct instance_api instances[INSTANCES] __asm(INSTANCE_START);
+/* Linker-generated bounds of the instance tables, one per linked instance image. */
+extern const struct instance_api instances[INSTANCES] __asm("__start_" INSTANCE_SECTION);
+extern const struct instance_api instances_end[] __asm("__stop_" INSTANCE_SECTION);
 /* Eleven slots hold deliveries delayed by one through ten world ticks. */
 static struct batch deliveries[11][INSTANCES + 1], outputs[INSTANCES];
 static uint64_t     next_wake[INSTANCES], last_heartbeat[INSTANCES];
 static uint32_t     random_state = 1;
-/* Reference mode: enter every device on every tick instead of skipping idle ones. */
-static int always_tick;
 /* FNV-1a hash over every message and its delivery tick, in acceptance order. */
 static uint64_t trace_hash = 0xcbf29ce484222325u, trace_count;
 
@@ -26,8 +25,13 @@ static void step(uint64_t start, uint64_t until) {
 	}
 	for (unsigned i = 0; i < INSTANCES; i++) {
 		outputs[i].count = 0;
-		if (always_tick || inputs[i].count || next_wake[i] <= until)
-			next_wake[i] = instances[i].run(start, until, &inputs[i], &outputs[i]);
+		if (!inputs[i].count && next_wake[i] > until) continue; /* Idle: skip it */
+		const struct instance_api* device = &instances[i];
+		/* Catch up omitted, event-free time before making new input visible. */
+		if (device->now() < start) device->advance(start);
+		device->attach(&inputs[i], &outputs[i]);
+		if (inputs[i].count) device->interrupt(RPC_IRQ);
+		next_wake[i] = device->advance(until);
 	}
 
 	/* Accept send requests only after all grants finish. */
@@ -48,9 +52,12 @@ static void step(uint64_t start, uint64_t until) {
 	}
 }
 
-int main(int argc, char** argv) {
-	uint64_t end_us = argc > 1 ? strtoull(argv[1], NULL, 10) : 60000000;
-	always_tick     = argc > 2;
+int main(void) {
+	uint64_t end_us = 3600000000; /* One simulated hour */
+	if (instances_end - instances != INSTANCES) {
+		fprintf(stderr, "linked %td instances, expected %d\n", instances_end - instances, INSTANCES);
+		return 1;
+	}
 	for (unsigned i = 0; i < INSTANCES; i++) instances[i].boot(i);
 	for (uint64_t time = 1000; time <= end_us; time += 1000) step(time - 1000, time);
 	step(end_us, end_us); /* Deliver packets due exactly at the endpoint. */

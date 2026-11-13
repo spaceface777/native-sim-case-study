@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Raul Hernandez <me@spaceface.dev>
+Date: Fri, 13 Nov 2026 17:59:10 +0100
+Subject: [PATCH] native_simulator: add a coroutine NCE
+
+nce.c runs the embedded CPU in its own host thread. Each time the CPU
+wakes or halts, that thread and the hardware models' thread hand
+execution over with semaphores, through the host's scheduler.
+
+Add nce_coro.c, which implements nce_if.h with a coroutine in the
+hardware models' host thread: waking the CPU switches to it, and
+halting switches back.
+
+The embedded software must then stay in that host thread, so it needs
+an NCT which keeps it there, like nct_coro.c. The NCT can still be
+selected alone, with nce.c.
+
+Select it with NSI_NCE=coroutines, in Zephyr with
+CONFIG_NATIVE_SIMULATOR_NCE_COROUTINES.
+---
+ scripts/native_simulator/Makefile             |   6 +-
+ .../native_simulator/common/coro/nce_coro.c   | 120 ++++++++++++++++++
+ soc/native/inf_clock/Kconfig                  |  14 ++
+ 3 files changed, 139 insertions(+), 1 deletion(-)
+ create mode 100644 scripts/native_simulator/common/coro/nce_coro.c
+
+diff --git a/scripts/native_simulator/Makefile b/scripts/native_simulator/Makefile
+index 871870d16e2..d6c8b0922f5 100644
+--- a/scripts/native_simulator/Makefile
++++ b/scripts/native_simulator/Makefile
+@@ -41,7 +41,8 @@ NSI_LINK_OPTIONS?=${NSI_ARCH} ${NSI_COVERAGE}
+ NSI_BUILD_C_OPTIONS?=
+ NSI_BUILD_CXX_OPTIONS?=
+ #  CPU start/stop (NCE) and thread (NCT) emulation: "pthreads" builds common/src/nce.c and nct.c.
+-#  NSI_NCT=coroutines builds common/coro/nct_coro.c instead.
++#  "coroutines" builds common/coro/nce_coro.c and nct_coro.c instead. A coroutine NCE needs an NCT
++#  which keeps the embedded software in one host thread: nct_coro.c does, nct.c does not.
+ #  With any other value the runner is built without them, and NSI_EXTRA_SRCS must provide
+ #  the functions of nce_if.h or nct_if.h
+ NSI_NCE?=pthreads
+@@ -95,6 +96,9 @@ endif
+ ifeq (${NSI_NCT},pthreads)
+   SRCS+=${NSI_PATH}common/src/nct.c
+ endif
++ifeq (${NSI_NCE},coroutines)
++  SRCS+=${NSI_PATH}common/coro/nce_coro.c
++endif
+ ifeq (${NSI_NCT},coroutines)
+   SRCS+=${NSI_PATH}common/coro/nct_coro.c
+ endif
+diff --git a/scripts/native_simulator/common/coro/nce_coro.c b/scripts/native_simulator/common/coro/nce_coro.c
+new file mode 100644
+index 00000000000..5d71240d317
+--- /dev/null
++++ b/scripts/native_simulator/common/coro/nce_coro.c
+@@ -0,0 +1,120 @@
++/*
++ * Copyright (c) 2026 Raúl Hernández López
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/*
++ * Native simulator CPU start/stop emulation with coroutines, instead of nce.c's host threads.
++ *
++ * nce.c runs the embedded CPU in its own host thread. That thread and the hardware models'
++ * thread hand execution to each other with semaphores, so the host's scheduler takes part
++ * each time the CPU wakes or halts.
++ *
++ * Here the embedded CPU is a coroutine in the hardware models' host thread. Waking the CPU
++ * switches to it, and halting it switches back.
++ *
++ * So the embedded software must stay in that host thread: it requires an NCT which does too,
++ * like nct_coro.c. What differs from nce.c for the user is described there.
++ */
++
++#include <stdbool.h>
++#include <stdlib.h>
++#include "nce_if.h"
++#include "nsi_coro.h"
++#include "nsi_main.h"
++#include "nsi_tracing.h"
++
++struct nce {
++	struct nsi_coro cpu; /* Where the CPU resumes: its boot code, or where it halted */
++	struct nsi_coro hw;  /* Where the hardware models resume when the CPU halts */
++	bool cpu_halted;
++	bool terminate;
++	void (*start_routine)(void);
++};
++
++static void nce_boot(void *this_arg)
++{
++	struct nce *this = this_arg;
++
++	this->start_routine();
++}
++
++/* Initialize an instance of the CPU emulator */
++void *nce_init(void)
++{
++	struct nce *this = calloc(1, sizeof(*this));
++
++	if (this == NULL) {
++		nsi_print_error_and_exit("%s: Can't allocate memory\n", __func__);
++	}
++	this->cpu_halted = true;
++	return this;
++}
++
++/*
++ * Called by the hardware models, with the CPU halted: nothing to do.
++ * Called by the embedded software: resume the hardware models, which then exit. Never return.
++ */
++void nce_terminate(void *this_arg)
++{
++	struct nce *this = this_arg;
++
++	if ((this == NULL) || this->cpu_halted) {
++		return;
++	}
++	this->terminate = true;
++	this->cpu_halted = true;
++	nsi_coro_switch(&this->cpu, &this->hw);
++}
++
++/*
++ * Boot the CPU: run <start_routine> on a new stack, and return when the embedded software
++ * first calls nce_halt_cpu().
++ */
++void nce_boot_cpu(void *this_arg, void (*start_routine)(void))
++{
++	struct nce *this = this_arg;
++
++	this->start_routine = start_routine;
++	nsi_coro_create(&this->cpu, nce_boot, this);
++	nce_wake_cpu(this);
++}
++
++/* Halt the CPU: resume the hardware models, and return when they call nce_wake_cpu(). */
++void nce_halt_cpu(void *this_arg)
++{
++	struct nce *this = this_arg;
++
++	if (this->cpu_halted) {
++		nsi_print_error_and_exit("Programming error on: %s ",
++					 "This CPU was already halted\n");
++	}
++	this->cpu_halted = true;
++	nsi_coro_switch(&this->cpu, &this->hw);
++}
++
++/* Wake the CPU: resume the embedded software, and return when it calls nce_halt_cpu(). */
++void nce_wake_cpu(void *this_arg)
++{
++	struct nce *this = this_arg;
++
++	if (!this->cpu_halted) {
++		nsi_print_error_and_exit("Programming error on: %s ",
++					 "This CPU was already awake\n");
++	}
++	this->cpu_halted = false;
++	nsi_coro_switch(&this->hw, &this->cpu);
++
++	if (this->terminate) {
++		nsi_exit(0);
++	}
++}
++
++/* Return 0 if the CPU is sleeping (or terminated), and !=0 if the CPU is running */
++int nce_is_cpu_running(void *this_arg)
++{
++	struct nce *this = this_arg;
++
++	return (this != NULL) && !this->cpu_halted;
++}
+diff --git a/soc/native/inf_clock/Kconfig b/soc/native/inf_clock/Kconfig
+index 4cb216b4741..aadee7b7e63 100644
+--- a/soc/native/inf_clock/Kconfig
++++ b/soc/native/inf_clock/Kconfig
+@@ -68,6 +68,20 @@ config NATIVE_SIMULATOR_NCE_PTHREADS
+ 	  The embedded CPU runs in its own host thread. The hardware models' thread and it hand
+ 	  execution to each other with semaphores.
+ 
++config NATIVE_SIMULATOR_NCE_COROUTINES
++	bool "Coroutines"
++	depends on NATIVE_SIMULATOR_NCT_COROUTINES || NATIVE_SIMULATOR_NCT_CUSTOM
++	depends on NATIVE_SIMULATOR_NUMBER_MCUS = 1
++	help
++	  The embedded CPU is a coroutine in the hardware models' host thread. Waking and
++	  halting the CPU switch stack and registers in that host thread, without the host's
++	  scheduler. Applications whose CPU wakes very often (many timer or hardware events,
++	  each with little work) run several times faster.
++
++	  The embedded software must stay in that host thread, so the threads cannot be host
++	  threads. The whole simulation is then one host thread:
++	  see NATIVE_SIMULATOR_NCT_COROUTINES for what that changes.
++
+ config NATIVE_SIMULATOR_NCE_CUSTOM
+ 	bool "Provided by the application"
+ 	help

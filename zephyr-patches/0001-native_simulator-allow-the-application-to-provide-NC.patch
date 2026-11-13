@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Raul Hernandez <me@spaceface.dev>
+Date: Fri, 13 Nov 2026 17:46:19 +0100
+Subject: [PATCH] native_simulator: allow the application to provide NCE and
+ NCT
+
+The runner always builds nce.c and nct.c, which emulate the CPU's
+start/stop and the embedded threads with host threads.
+
+Add NSI_NCE and NSI_NCT to the runner's Makefile. With their default,
+"pthreads", nothing changes. With any other value the runner is built
+without that file, and NSI_EXTRA_SRCS provide the functions of nce_if.h
+or nct_if.h instead.
+
+In Zephyr, CONFIG_NATIVE_SIMULATOR_NCE_CUSTOM and _NCT_CUSTOM select
+this. The application adds its implementation with
+target_sources(native_simulator INTERFACE <file>).
+---
+ boards/native/common/natsim_config.cmake | 10 ++++++
+ scripts/native_simulator/Makefile        | 13 +++++++-
+ soc/native/inf_clock/Kconfig             | 41 ++++++++++++++++++++++++
+ 3 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/boards/native/common/natsim_config.cmake b/boards/native/common/natsim_config.cmake
+index 766937fb8e3..a154376d292 100644
+--- a/boards/native/common/natsim_config.cmake
++++ b/boards/native/common/natsim_config.cmake
+@@ -22,8 +22,18 @@ if("${LINKER}" STREQUAL "lld")
+   target_link_options(native_simulator INTERFACE "-fuse-ld=lld")
+ endif()
+ 
++foreach(component NCE NCT)
++  if(CONFIG_NATIVE_SIMULATOR_${component}_CUSTOM)
++    set(nsi_${component} custom)
++  else()
++    set(nsi_${component} pthreads)
++  endif()
++endforeach()
++
+ set(nsi_config_content
+   ${nsi_config_content}
++  "NSI_NCE:=${nsi_NCE}"
++  "NSI_NCT:=${nsi_NCT}"
+   "NSI_AR:=${CMAKE_AR}"
+   "NSI_BUILD_OPTIONS:=$<JOIN:$<TARGET_PROPERTY:native_simulator,INTERFACE_COMPILE_OPTIONS>,\ >"
+   "NSI_BUILD_PATH:=${zephyr_build_path}/NSI"
+diff --git a/scripts/native_simulator/Makefile b/scripts/native_simulator/Makefile
+index 905fe88be98..347d2e15419 100644
+--- a/scripts/native_simulator/Makefile
++++ b/scripts/native_simulator/Makefile
+@@ -40,6 +40,11 @@ NSI_BUILD_OPTIONS?=${NSI_ARCH} ${NSI_COVERAGE}
+ NSI_LINK_OPTIONS?=${NSI_ARCH} ${NSI_COVERAGE}
+ NSI_BUILD_C_OPTIONS?=
+ NSI_BUILD_CXX_OPTIONS?=
++#  CPU start/stop (NCE) and thread (NCT) emulation: "pthreads" builds common/src/nce.c and nct.c.
++#  With any other value the runner is built without them, and NSI_EXTRA_SRCS must provide
++#  the functions of nce_if.h or nct_if.h
++NSI_NCE?=pthreads
++NSI_NCT?=pthreads
+ #  Extra source files to be built in the runner context
+ NSI_EXTRA_SRCS?=
+ #  Extra include directories to be used while building in the runner context
+@@ -82,7 +87,13 @@ no_default:
+ 
+ RUNNER_LIB:=runner.a
+ 
+-SRCS:=$(shell ls ${NSI_PATH}common/src/*.c)
++SRCS:=$(filter-out %/nce.c %/nct.c,$(shell ls ${NSI_PATH}common/src/*.c))
++ifeq (${NSI_NCE},pthreads)
++  SRCS+=${NSI_PATH}common/src/nce.c
++endif
++ifeq (${NSI_NCT},pthreads)
++  SRCS+=${NSI_PATH}common/src/nct.c
++endif
+ ifdef NSI_NATIVE
+   SRCS+=$(shell ls ${NSI_PATH}native/src/*.c)
+ endif
+diff --git a/soc/native/inf_clock/Kconfig b/soc/native/inf_clock/Kconfig
+index defcc74ee45..86469a150a8 100644
+--- a/soc/native/inf_clock/Kconfig
++++ b/soc/native/inf_clock/Kconfig
+@@ -55,4 +55,45 @@ config NATIVE_SIMULATOR_STATIC_LINKING
+ 
+ 	  Static linking depends on all required libraries being available as static libraries.
+ 
++choice NATIVE_SIMULATOR_NCE
++	prompt "CPU start/stop emulation (NCE)"
++	default NATIVE_SIMULATOR_NCE_PTHREADS
++	help
++	  How the native simulator runner hands execution between the hardware models and the
++	  embedded CPU.
++
++config NATIVE_SIMULATOR_NCE_PTHREADS
++	bool "Host threads"
++	help
++	  The embedded CPU runs in its own host thread. The hardware models' thread and it hand
++	  execution to each other with semaphores.
++
++config NATIVE_SIMULATOR_NCE_CUSTOM
++	bool "Provided by the application"
++	help
++	  Build the runner without nce.c. The application provides the functions of nce_if.h, in a
++	  source file it adds with target_sources(native_simulator INTERFACE <file>).
++
++endchoice
++
++choice NATIVE_SIMULATOR_NCT
++	prompt "Thread emulation (NCT)"
++	default NATIVE_SIMULATOR_NCT_PTHREADS
++	help
++	  How the native simulator runner runs the threads of the embedded OS.
++
++config NATIVE_SIMULATOR_NCT_PTHREADS
++	bool "Host threads"
++	help
++	  Each embedded thread runs in its own host thread. They hand execution to each other
++	  with semaphores, so that only the one the embedded OS selected runs.
++
++config NATIVE_SIMULATOR_NCT_CUSTOM
++	bool "Provided by the application"
++	help
++	  Build the runner without nct.c. The application provides the functions of nct_if.h, in a
++	  source file it adds with target_sources(native_simulator INTERFACE <file>).
++
++endchoice
++
+ endif # SOC_POSIX

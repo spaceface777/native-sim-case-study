@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Raul Hernandez <me@spaceface.dev>
+Date: Fri, 13 Nov 2026 18:09:05 +0100
+Subject: [PATCH] native_simulator: coroutines: switch with siglongjmp()
+
+swapcontext() saves and restores the signal mask, so each coroutine
+switch makes a system call.
+
+Add NSI_CORO_SIGLONGJMP. With it, ucontext only starts each coroutine,
+and each later switch is a sigsetjmp() and a siglongjmp() which leave
+the signal mask alone. QEMU's coroutines do the same.
+
+No standard defines a longjmp() to another stack. glibc allows it, but
+its fortified longjmp() does not: nsi_coro.c is then built without
+_FORTIFY_SOURCE.
+
+Unlike swapcontext(), these do not switch the floating point
+environment. With NSI_CORO_FP_ENV, nsi_coro_switch() saves and restores
+it. Zephyr defines that with CONFIG_FPU_SHARING, as on embedded
+targets, where the kernel only saves the floating point context of
+each thread with that option.
+
+In Zephyr, select it with CONFIG_NATIVE_SIMULATOR_CORO_SIGLONGJMP.
+---
+ boards/native/common/natsim_config.cmake      |  7 ++++
+ .../native_simulator/common/coro/nsi_coro.c   | 41 ++++++++++++++++++-
+ .../native_simulator/common/coro/nsi_coro.h   |  8 ++++
+ soc/native/inf_clock/Kconfig                  | 17 ++++++++
+ 4 files changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/boards/native/common/natsim_config.cmake b/boards/native/common/natsim_config.cmake
+index 82d0517251a..96fa0f85fa3 100644
+--- a/boards/native/common/natsim_config.cmake
++++ b/boards/native/common/natsim_config.cmake
+@@ -32,6 +32,13 @@ foreach(component NCE NCT)
+   endif()
+ endforeach()
+ 
++if(CONFIG_NATIVE_SIMULATOR_CORO_SIGLONGJMP)
++  target_compile_options(native_simulator INTERFACE -DNSI_CORO_SIGLONGJMP)
++  if(CONFIG_FPU_SHARING)
++    target_compile_options(native_simulator INTERFACE -DNSI_CORO_FP_ENV)
++  endif()
++endif()
++
+ set(nsi_config_content
+   ${nsi_config_content}
+   "NSI_NCE:=${nsi_NCE}"
+diff --git a/scripts/native_simulator/common/coro/nsi_coro.c b/scripts/native_simulator/common/coro/nsi_coro.c
+index 4167982e87c..becd782d8c9 100644
+--- a/scripts/native_simulator/common/coro/nsi_coro.c
++++ b/scripts/native_simulator/common/coro/nsi_coro.c
+@@ -7,10 +7,27 @@
+ /*
+  * Stackful coroutines with the host C library's ucontext: it knows the host's ABI, and
+  * which registers and state a context switch must save.
++ *
++ * By default each switch is a swapcontext(). That also saves and restores the signal mask,
++ * with a system call, and (in glibc) the floating point environment.
++ *
++ * With NSI_CORO_SIGLONGJMP, ucontext only starts each coroutine, and each later switch is a
++ * sigsetjmp() and a siglongjmp() which leave the signal mask alone: no system call.
++ * QEMU's coroutines do the same. But:
++ *  - No standard defines a longjmp() to another stack. C libraries just restore the saved
++ *    registers. glibc's fortified longjmp() checks the stack, and refuses: this file must
++ *    be built without _FORTIFY_SOURCE.
++ *  - They do not save the floating point environment (rounding mode, exception flags and
++ *    traps). All coroutines share it, unless NSI_CORO_FP_ENV is defined. Then
++ *    nsi_coro_switch() saves and restores it, which costs time.
+  */
+ 
+ #define _GNU_SOURCE
++#if defined(NSI_CORO_SIGLONGJMP)
++#undef _FORTIFY_SOURCE
++#endif
+ #include <errno.h>
++#include <fenv.h>
+ #include <stdint.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+@@ -18,7 +35,7 @@
+ #include "nsi_tracing.h"
+ 
+ /*
+- * swapcontext() switches what the CPU holds. errno and the C++ runtime's exception state
++ * A switch changes what the CPU holds. errno and the C++ runtime's exception state
+  * (if one is linked) are instead thread-local data of the host thread, which all its
+  * coroutines share: nsi_coro_switch() keeps each coroutine's own.
+  */
+@@ -59,6 +76,9 @@ void nsi_coro_create(struct nsi_coro *coro, void (*entry)(void *arg), void *arg)
+ 	/* makecontext() passes int arguments only */
+ 	makecontext(&coro->context, (void (*)(void))start, 2, (unsigned int)(self >> 32),
+ 		    (unsigned int)self);
++#if defined(NSI_CORO_SIGLONGJMP)
++	coro->resumable = false;
++#endif
+ }
+ 
+ void nsi_coro_free(struct nsi_coro *coro)
+@@ -76,9 +96,28 @@ void nsi_coro_switch(struct nsi_coro *from, struct nsi_coro *to)
+ 		saved_eh = *__cxa_get_globals();
+ 	}
+ 
++#if defined(NSI_CORO_SIGLONGJMP)
++#if defined(NSI_CORO_FP_ENV)
++	fenv_t saved_fp_env;
++
++	fegetenv(&saved_fp_env);
++#endif
++	from->resumable = true;
++	if (sigsetjmp(from->env, 0) == 0) {
++		if (to->resumable) {
++			siglongjmp(to->env, 1);
++		}
++		setcontext(&to->context);
++		nsi_print_error_and_exit("%s: setcontext() failed\n", __func__);
++	}
++#if defined(NSI_CORO_FP_ENV)
++	fesetenv(&saved_fp_env);
++#endif
++#else
+ 	if (swapcontext(&from->context, &to->context) != 0) {
+ 		nsi_print_error_and_exit("%s: swapcontext() failed\n", __func__);
+ 	}
++#endif
+ 
+ 	if (__cxa_get_globals != NULL) {
+ 		*__cxa_get_globals() = saved_eh;
+diff --git a/scripts/native_simulator/common/coro/nsi_coro.h b/scripts/native_simulator/common/coro/nsi_coro.h
+index 4cfdc230b13..d882ae53263 100644
+--- a/scripts/native_simulator/common/coro/nsi_coro.h
++++ b/scripts/native_simulator/common/coro/nsi_coro.h
+@@ -11,13 +11,21 @@
+ #ifndef NSI_COMMON_CORO_NSI_CORO_H
+ #define NSI_COMMON_CORO_NSI_CORO_H
+ 
++#include <setjmp.h>
++#include <stdbool.h>
+ #include <ucontext.h>
+ 
+ /* As a host thread's. It is only reserved: the host commits the pages that are used. */
+ #define NSI_CORO_STACK_SIZE (8 * 1024 * 1024)
+ 
+ struct nsi_coro {
++#if defined(NSI_CORO_SIGLONGJMP)
++	ucontext_t context; /* Where it starts */
++	sigjmp_buf env;     /* Where it resumes, while it is switched out */
++	bool resumable;     /* It has run: resume it. Otherwise, start it */
++#else
+ 	ucontext_t context; /* Where it resumes, while it is switched out */
++#endif
+ 	void *stack;
+ 	void (*entry)(void *arg);
+ 	void *arg;
+diff --git a/soc/native/inf_clock/Kconfig b/soc/native/inf_clock/Kconfig
+index aadee7b7e63..c564f4a99df 100644
+--- a/soc/native/inf_clock/Kconfig
++++ b/soc/native/inf_clock/Kconfig
+@@ -129,4 +129,21 @@ config NATIVE_SIMULATOR_NCT_CUSTOM
+ 
+ endchoice
+ 
++config NATIVE_SIMULATOR_CORO_SIGLONGJMP
++	bool "Switch coroutines with siglongjmp()"
++	depends on NATIVE_SIMULATOR_NCT_COROUTINES
++	help
++	  swapcontext() saves and restores the signal mask, with a system call on each switch.
++	  With this option, the host C library's ucontext only starts each coroutine. Each later
++	  switch is a sigsetjmp() and a siglongjmp() which leave the signal mask alone, and is
++	  several times faster.
++
++	  No standard defines a longjmp() to another stack, but C libraries allow it. It works
++	  with glibc, when that one file is built without _FORTIFY_SOURCE: the build does that.
++
++	  The floating point environment (rounding mode, exception flags and traps) then
++	  follows FPU_SHARING, as on embedded targets. With FPU_SHARING, each embedded thread
++	  has its own, saved and restored on each switch. Without, all share one.
++	  (swapcontext() always switches it, and host threads each have their own.)
++
+ endif # SOC_POSIX

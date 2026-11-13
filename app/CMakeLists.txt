@@ -4,5 +4,9 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(native_sim_case_study)
 target_sources(app PRIVATE main.c)
 target_sources(native_simulator INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/runner.c)
-separate_arguments(runner_options NATIVE_COMMAND "${CONFIG_COMPILER_OPT}")
-target_compile_options(native_simulator INTERFACE -DNSI_NO_MAIN ${runner_options} -fno-common)
+if(CONFIG_NATIVE_SIMULATOR_NCT_CUSTOM)
+  # This application's own CPU and thread emulation, instead of Zephyr's.
+  target_sources(native_simulator INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/../nct-nce-custom-asm.c)
+endif()
+# Zephyr builds the runner without optimization by default.
+target_compile_options(native_simulator INTERFACE -O2)

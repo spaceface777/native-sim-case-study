@@ -1,65 +1,105 @@
-# Distributed-device native_sim case study
+# 20 devices in one native_sim process
 
-A case study for [Zephyr #120914](https://github.com/zephyrproject-rtos/zephyr/issues/120914): 20 independent devices in one simulated world.
+A case study for [Zephyr #120914](https://github.com/zephyrproject-rtos/zephyr/issues/120914), which proposes that native_sim can run the embedded CPU and its threads as coroutines instead of host threads.
 
-Each device has its own Zephyr kernel, application state, clock, hardware models, and runner. The host and all 20 children link into one executable. No child images load at runtime.
+It contains:
+
+- **A workload** that switches context very often: a network of 20 simulated devices.
+- **The proposal** as four patches for Zephyr v4.5.0, in [`zephyr-patches/`](zephyr-patches).
+- **Measurements** of each patch.
 
 ## Workload
 
-Each device has three threads: a 100 ms heartbeat, deterministic multicast work every 10-100 ms, and an event/ACK receiver. The host delays messages by 1-10 ms. Devices run serially. Each grant ends after equal-time hardware events. The host omits idle grants and catches up each device's clock before input delivery.
+Each device is a complete native_sim image: its own Zephyr kernel, clock, hardware models and native simulator runner. [`simulator.c`](simulator.c) links 20 copies of it into one process. It runs them one after the other, one millisecond at a time, and delivers each message 1 to 10 ms after it was sent.
 
-Each result contains 20 rows: acknowledged events and the last heartbeat that the world received. It also contains the complete traffic's FNV-1a hash and message count. Every timed result must match an always-ticked reference. NCT emulates Zephyr threads. NCE emulates CPU halt/wake. The four coroutine primitives share the same NCT/NCE implementation. Floating-point environment, errno, and C++ exception context preservation remain enabled.
+A device ([`app/main.c`](app/main.c)) has three threads: a heartbeat every 100 ms, one that sends events to other devices every 10 to 100 ms, and one that acknowledges the events it receives. It does very little each time it runs, so most of the run time is context switches of two kinds:
+
+- **Hardware models to CPU and back** (NCE), each time a device has a timer or a message to handle.
+- **Thread to thread** (NCT) inside a device.
+
+Upstream does both with host threads that hand execution over through semaphores.
+
+While conceptually similar, this does not make use of native_sim's multi-MCU support. There, the MCUs of one device share a clock and peripherals. Here, each device has its own.
+
+## Patches
+
+They apply to Zephyr v4.5.0, in order. Each adds options that are off by default.
+
+| Patch | What it adds | `CONFIG_NATIVE_SIMULATOR_` |
+|---|---|---|
+| [0001](zephyr-patches/0001-native_simulator-allow-the-application-to-provide-NC.patch) | The runner can be built without `nce.c` or `nct.c`, so that an application provides its own. | `NCE_CUSTOM`, `NCT_CUSTOM` |
+| [0002](zephyr-patches/0002-native_simulator-add-a-coroutine-NCT.patch) | Embedded threads as coroutines, switched with `swapcontext()`. Works with upstream's NCE. | `NCT_COROUTINES` |
+| [0003](zephyr-patches/0003-native_simulator-add-a-coroutine-NCE.patch) | The embedded CPU as a coroutine in the hardware models' host thread. Needs a coroutine NCT. | `NCE_COROUTINES` |
+| [0004](zephyr-patches/0004-native_simulator-coroutines-switch-with-siglongjmp.patch) | Switch with `siglongjmp()` instead of `swapcontext()`. | `CORO_SIGLONGJMP` |
+
+Together they add 600 lines to Zephyr. They contain no assembly and nothing specific to a host CPU: the host C library's `ucontext` creates each coroutine.
+
+[`nct-nce-custom-asm.c`](nct-nce-custom-asm.c) is not part of the proposal. It is this application's own NCE and NCT, built through patch 0001. Its switch is inline assembly that saves only the stack, frame and program counters.
+
+## Results
+
+One simulated hour on an Intel N100 (Ubuntu 26.04, GCC 15.2, glibc 2.43, bare metal), on one CPU. Each value is the median of three runs. Every run behaves identically.
+
+| NCT | NCE | Switch | Seconds | Real time | Against upstream |
+|---|---|---|---:|---:|---:|
+| host threads | host threads | upstream | 99.08 | 36x | 1.0x |
+| coroutines | host threads | `swapcontext()` | 56.41 | 64x | 1.8x |
+| coroutines | host threads | `siglongjmp()` | 41.40 | 87x | 2.4x |
+| coroutines | coroutines | `swapcontext()` | 17.49 | 206x | 5.7x |
+| coroutines | coroutines | `siglongjmp()`, `CONFIG_FPU_SHARING=y` | 12.86 | 280x | 7.7x |
+| coroutines | coroutines | `siglongjmp()` | 7.13 | 505x | 13.9x |
+| custom | custom | inline assembly | 5.58 | 645x | 17.8x |
+
+Real time is simulated time divided by wall time.
+
+The same on GitHub's Linux runners, which are virtual machines ([run](https://github.com/spaceface777/native-sim-case-study/actions/runs/43482955335)). Seconds, with the gain against upstream:
+
+| NCT | NCE | Switch | x86-64 | AArch64 |
+|---|---|---|---:|---:|
+| host threads | host threads | upstream | 191.29 | 80.07 |
+| coroutines | host threads | `swapcontext()` | 87.90 (2.2x) | 46.83 (1.7x) |
+| coroutines | host threads | `siglongjmp()` | 82.33 (2.3x) | 29.48 (2.7x) |
+| coroutines | coroutines | `swapcontext()` | 20.27 (9.4x) | 19.60 (4.1x) |
+| coroutines | coroutines | `siglongjmp()`, `CONFIG_FPU_SHARING=y` | 12.78 (15.0x) | 4.08 (19.6x) |
+| coroutines | coroutines | `siglongjmp()` | 6.90 (27.7x) | 3.95 (20.3x) |
+| custom | custom | inline assembly | 5.49 (34.8x) | 3.15 (25.4x) |
+
+- **One CPU is upstream's best case.** `run.sh` pins each run to one CPU. Without that, in another run, upstream took 283 s and 270 s, and `siglongjmp()` with both coroutines 3.8 s and 3.9 s: about 70x ([run](https://github.com/spaceface777/native-sim-case-study/actions/runs/43480809025)).
+- **NCE matters most here.** Most switches in this workload are between the hardware models and a CPU. An application with one device and many threads would gain more from the NCT alone.
+- **`swapcontext()` makes a system call on every switch**, to save and restore the signal mask. `siglongjmp()` does not.
+
+### The floating-point environment
+
+On embedded targets, Zephyr saves each thread's floating-point context (e.g. rounding mode and the exception flags) only with `CONFIG_FPU_SHARING`. Without the option, all threads share them. Patch 0004 does the same. In other words:
+
+| Emulation | Each thread keeps its own rounding mode |
+|---|---|
+| Host threads (upstream) | Always |
+| Coroutines, `swapcontext()` | Always: glibc saves it in the context |
+| Coroutines, `siglongjmp()` | Only with `CONFIG_FPU_SHARING=y` |
+
+Saving it costs 5.7 s of the 12.86 s above, because glibc's `fegetenv()` and `fesetenv()` are very slow on x86-64. On AArch64 it costs almost nothing.
 
 ## Run
 
-Use the [macOS/context-backends Zephyr branch](https://github.com/spaceface777/zephyr/tree/native-sim-context-backends-pr118530), at `a97d7e5a961` for this version. Both platforms need CMake, Ninja, and Boost.Context development files. Linux also needs GCC and binutils. macOS uses Xcode command-line tools and stock Bash. No LLVM package is required.
+Linux with GCC, CMake, Ninja, and Python with Zephyr's base packages.
 
 ```sh
-export ZEPHYR_BASE=/path/to/patched/zephyr
-./run.sh                         # all nine backends, five one-minute samples
-SIM_US=3600000000 ./run.sh        # five one-hour samples
+git clone --depth 1 -b v4.5.0 https://github.com/zephyrproject-rtos/zephyr
+git -C zephyr apply "$PWD"/zephyr-patches/*.patch
+export ZEPHYR_BASE=$PWD/zephyr
+./run.sh
 ```
 
-Linux measures CPU 0 and unpinned execution with identical binaries. macOS measures unpinned execution. The script retains samples and reference outputs under `build/<timestamp>/`. It writes the latest report to `build/results.md`. Nonstandard Boost installations can set `BOOST_ROOT` and `BOOST_LIBRARYDIR`.
+`run.sh` builds each variant, runs one simulated hour of it three times, and prints the table. It checks every run's output against a hash of upstream's. The output has, for each device, its acknowledged events and last heartbeat, then a hash and a count of all messages.
 
-Bash measures the complete process, including boot, hashing, output, and exit. There is no LTO. RT is simulated **world time divided by wall time**, not accumulated device-seconds. Linux speedups use the CPU 0 pthread/pthread baseline. Mac speedups use their batch's unpinned pthread/pthread baseline.
+## What the coroutines change
 
-The minute result is `trace ff72adfdb93a52fe 143218`, checksum `1801075893`. The hour result is `trace 3f3db497f9b30aeb 8571855`, checksum `1796618671`.
+With coroutines, the simulation is one host thread (or two, with upstream's NCE). The options' help texts say what follows from that:
 
-## Historical one-hour measurements — pre-cleanup
+- **Debuggers** show the embedded thread that is running, not the others.
+- **Thread-local storage** of the host is shared by all embedded threads. Only errno and the C++ exception state are saved and restored on context switches. (Zephyr's own `CONFIG_THREAD_LOCAL_STORAGE` is not supported on native_sim upstream.)
+- **Sanitizers and Valgrind** are not told about the switches. Kconfig refuses the address and memory sanitizers.
+- **`siglongjmp()` to another stack** is not defined by any standard. glibc allows it, but its fortified `longjmp()` does not, so patch 0004 builds that one file without `_FORTIFY_SOURCE`. QEMU's coroutines do the same.
 
-These tables describe the versions before this cleanup. Each value is the median of five complete one-hour runs. All samples remain in the medians.
-
-### Linux: Intel N100, Ubuntu 26.04, GCC 15.2
-
-Source: Zephyr `edfabfddfac`. Linux RT uses the CPU 0 wall-time column. All 90 measured results and 18 always-ticked references matched. This version used `_setjmp()`/`_longjmp()` for its libc primitive.
-
-| NCT | NCE | Primitive | Unpinned | Pinned | RT | Speedup |
-|---|---|---|---:|---:|---:|---:|
-| pthreads | pthreads | — | 121.690 | 99.964 | 36.0x | **1.00x** |
-| coroutines | pthreads | `ucontext` | 71.403 | 61.828 | 58.2x | **1.62x** |
-| coroutines | pthreads | `makecontext` + `_longjmp` | 65.204 | 52.647 | 68.4x | **1.90x** |
-| coroutines | pthreads | Boost.Context | 66.105 | 54.279 | 66.3x | **1.84x** |
-| coroutines | pthreads | Assembly | 63.469 | 48.518 | 74.2x | **2.06x** |
-| coroutines | coroutines | `ucontext` | 23.126 | 23.155 | 155.5x | **4.32x** |
-| coroutines | coroutines | `makecontext` + `_longjmp` | 13.283 | 13.260 | 271.5x | **7.54x** |
-| coroutines | coroutines | Boost.Context | 13.049 | 13.244 | 271.8x | **7.55x** |
-| coroutines | coroutines | Assembly | 12.205 | 11.796 | 305.2x | **8.47x** |
-
-### macOS: Apple M1, macOS 27.0.1, Apple Clang 21.0.0
-
-Source: Zephyr `a97d7e5a961` and application checkpoint `bbeeada`. Native arm64, `-O3 -mcpu=native`, one executable, static Boost.Context, no CPU pinning. All 45 measured results and nine always-ticked references matched Linux.
-
-| NCT | NCE | Primitive | Wall s | RT | Speedup |
-|---|---|---|---:|---:|---:|
-| pthreads | pthreads | — | 67.165 | 53.6x | **1.00x** |
-| coroutines | pthreads | `ucontext` | 50.331 | 71.5x | **1.33x** |
-| coroutines | pthreads | `makecontext` + `siglongjmp` | 35.719 | 100.8x | **1.88x** |
-| coroutines | pthreads | Boost.Context | 35.163 | 102.4x | **1.91x** |
-| coroutines | pthreads | Assembly | 34.767 | 103.5x | **1.93x** |
-| coroutines | coroutines | `ucontext` | 26.205 | 137.4x | **2.56x** |
-| coroutines | coroutines | `makecontext` + `siglongjmp` | 4.099 | 878.3x | **16.39x** |
-| coroutines | coroutines | Boost.Context | 3.980 | 904.5x | **16.88x** |
-| coroutines | coroutines | Assembly | 3.858 | 933.1x | **17.41x** |
-
-The Mac batch ran on 2026-10-10, 17:51:40-18:21:31 +0200, on AC power with charge at 37%-63%. Other applications ran throughout. No system sleep occurred. These are busy-machine measurements, not controlled cross-machine comparisons. These measurements do not isolate the linking change.
+Zephyr's own samples and kernel test suites pass with each combination above, on the 64-bit and 32-bit native_sim boards (x86-64, glibc). CI runs this case study on x86-64 and AArch64.

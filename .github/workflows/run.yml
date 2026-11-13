@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Build and time the world on GitHub's Linux runners, which are virtual machines.
+name: Run
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  run:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: zephyrproject-rtos/zephyr
+          ref: v4.5.0
+          path: zephyr
+      - name: Install Zephyr's requirements
+        run: |
+          git -C zephyr apply "$PWD"/zephyr-patches/*.patch
+          sudo apt-get install -y ninja-build
+          python3 -m venv venv
+          venv/bin/pip install cmake pyelftools pyyaml pykwalify packaging jsonschema
+      - name: Build and time
+        shell: bash # With pipefail: a failure of run.sh fails the step
+        run: . venv/bin/activate && ZEPHYR_BASE="$PWD/zephyr" ./run.sh | tee -a "$GITHUB_STEP_SUMMARY"
